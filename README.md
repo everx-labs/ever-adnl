@@ -1,13 +1,18 @@
-# ADNL
-ADNL protocol implementation (UDP & TCP)
+# ADNL protocol implementation (UDP & TCP)
 
 ## Prerequisites
 
 - https://www.rust-lang.org/en-US/install.html
 - GNU make 
 
-## To run tests:
-
+## Cloning
 ```
-make
+git clone https://github.com/tonlabs/ton-labs-adnl.git
+cd ton-labs-adnl
+git submodule init
+git submodule update
+```
+## Build
+```
+cargo build --release
 ```
