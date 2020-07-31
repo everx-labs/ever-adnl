@@ -1,9 +1,11 @@
 use aes_ctr::stream_cipher::{NewStreamCipher, SyncStreamCipher};
 use core::ops::Range;
+use ed25519::signature::{Signature, Verifier};
 use rand::Rng;
 use sha2::Digest;
 use std::{
-    fmt::{self, Debug, Display, Formatter}, hash::Hash, sync::{Arc, atomic::{AtomicU64, Ordering}},
+    fmt::{self, Debug, Display, Formatter}, hash::Hash, 
+    sync::{Arc, atomic::{AtomicU64, AtomicUsize, Ordering}},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH}
 };
 use tokio::prelude::*;
@@ -20,6 +22,7 @@ use ton_api::{
             pong::Pong as AdnlPong
         },
         pub_::publickey::Ed25519,
+        rldp::message::{Answer as RldpAnswer, Query as RldpQuery},
         rpc::adnl::Ping as AdnlPing
     }
 };
@@ -84,6 +87,24 @@ macro_rules! from_slice {
              $y[$iy +  6], $y[$iy +  7], $y[$iy +  8], $y[$iy +  9], $y[$iy + 10], $y[$iy + 11], 
          ]
     }
+}
+
+#[macro_export]
+macro_rules! trace {
+    ($target:expr, $func:expr) => {
+        {
+            if log::log_enabled!(log::Level::Debug) {
+                let msg = stringify!($func);
+                let pos = msg.find('\n').unwrap_or(80);
+                log::debug!(target: $target, "before {}...", &msg[..pos]);
+                let ret = $func;
+                log::debug!(target: $target, "after {}...", &msg[..pos]);
+                ret
+            } else {
+                $func
+            }
+        }
+    };
 }
 
 /// ADNL crypto utils
@@ -215,11 +236,43 @@ impl AdnlHandshake {
 
 }
 
+/// ADNL peers
+#[derive(Clone)]
+pub struct AdnlPeers(Arc<KeyId>, Arc<KeyId>);
+
+impl AdnlPeers {
+
+    /// Constructor
+    pub fn with_keys(local: Arc<KeyId>, other: Arc<KeyId>) -> Self {
+        Self(local, other)
+    }
+
+    /// Local peer
+    pub fn local(&self) -> &Arc<KeyId> {
+        let AdnlPeers(local, _) = self;
+        local 
+    }
+
+    /// Other peer
+    pub fn other(&self) -> &Arc<KeyId> {
+        let AdnlPeers(_, other) = self;
+        other 
+    }
+
+    /// Change other peer
+    pub fn set_other(&mut self, other: Arc<KeyId>) {
+        let AdnlPeers(_, old_other) = self;
+        *old_other = other
+    }
+
+}
+
 /// ADNL ping subscriber
 pub struct AdnlPingSubscriber;
 
+#[async_trait::async_trait]
 impl Subscriber for AdnlPingSubscriber {
-    fn try_consume_query(&self, object: TLObject) -> Result<QueryResult> {
+    async fn try_consume_query(&self, object: TLObject) -> Result<QueryResult> {
         match object.downcast::<AdnlPing>() {
             Ok(ping) => QueryResult::consume(AdnlPong { value: ping.value }),
             Err(object) => Ok(QueryResult::Rejected(object))
@@ -526,7 +579,7 @@ impl KeyOption {
             fail!("Verify is available for Ed25519 key only")
         }
         let pub_key = ed25519_dalek::PublicKey::from_bytes(self.pub_key()?)?;
-        pub_key.verify(data, &ed25519_dalek::Signature::from_bytes(signature)?)?;
+        pub_key.verify(data, &ed25519::Signature::from_bytes(signature)?)?;
         Ok(())
     }
 
@@ -551,8 +604,6 @@ pub enum Query {
 }
 
 impl Query {
-
-    pub const TIMEOUT: u64 = 3000; // Milliseconds
 
     /// Construct new query
     pub fn new() -> (Arc<tokio::sync::Barrier>, Self) {
@@ -589,64 +640,93 @@ impl Query {
             Err(answer) => fail!("Unsupported response to {:?}: {:?}", query, answer)
         }
     }
-
-    /// Process query
-    pub fn process(
+    
+    /// Process ADNL query
+    pub async fn process_adnl(
         subscribers: &Vec<Arc<dyn Subscriber>>,
         query: &AdnlQueryMessage                                                                    
     ) -> Result<(bool, Option<AdnlMessage>)> {
-        let query_id = query.query_id.0;
-        let mut queries = deserialize_bundle(&query.query[..])?;
-        if queries.len() == 1 {
-            let mut query = queries.remove(0);
-            for subscriber in subscribers.iter() {
-                query = match subscriber.try_consume_query(query)? {
-                    QueryResult::Consumed(answer) => return Self::answer(answer, query_id),
-                    QueryResult::Rejected(query) => query,
-                    QueryResult::RejectedBundle(_) => unreachable!()
-                };
-            }
+        if let (true, answer) = Self::process(subscribers, &query.query[..]).await? {
+            Self::answer(
+                answer,
+                |answer| AdnlAnswerMessage {
+                    query_id: query.query_id.clone(),  
+                    answer: ton::bytes(answer)
+                }.into_boxed()
+            )
         } else {
-            for subscriber in subscribers.iter() {
-                queries = match subscriber.try_consume_query_bundle(queries)? {
-                    QueryResult::Consumed(answer) => return Self::answer(answer, query_id),
-                    QueryResult::Rejected(_) => unreachable!(),
-                    QueryResult::RejectedBundle(queries) => queries
-                };
-            }
-        };
-        Ok((false, None))
+            Ok((false, None))
+        }
     }
 
     /// Process custom message
-    pub fn process_custom(
+    pub async fn process_custom(
         subscribers: &Vec<Arc<dyn Subscriber>>,
-        custom: &AdnlCustomMessage
+        custom: &AdnlCustomMessage,
+        peers: &AdnlPeers
     ) -> Result<bool> {
         for subscriber in subscribers.iter() {
-            if subscriber.try_consume_custom(&custom.data)? {
+            if subscriber.try_consume_custom(&custom.data, peers).await? {
                 return Ok(true);
             }
         }
         Ok(false)
     }
 
-    fn answer(
-        answer: Option<TLObject>, 
-        query_id: QueryId
-    ) -> Result<(bool, Option<AdnlMessage>)> {
+    /// Process RLDP query
+    pub async fn process_rldp(
+        subscribers: &Vec<Arc<dyn Subscriber>>,
+        query: &RldpQuery                                                                    
+    ) -> Result<(bool, Option<RldpAnswer>)> {
+        if let (true, answer) = Self::process(subscribers, &query.data[..]).await? {
+            Self::answer(
+                answer, 
+                |answer| RldpAnswer {
+                    query_id: query.query_id.clone(),  
+                    data: ton::bytes(answer)
+                }
+            )
+        } else {
+            Ok((false, None))
+        }
+    }
+
+    fn answer<A>(
+        answer: Option<TLObject>,
+        convert: impl Fn(Vec<u8>) -> A
+    ) -> Result<(bool, Option<A>)> {
         let answer = if let Some(answer) = answer {
             Some(serialize(&answer)?)
         } else {
             None
         }; 
-        let answer = answer.map(|answer|
-            AdnlAnswerMessage {
-                query_id: ton::int256(query_id),  
-                answer: ton::bytes(answer)
-            }.into_boxed()
-        );
-        Ok((true, answer))
+        Ok((true, answer.map(convert)))
+    }
+
+    async fn process(
+        subscribers: &Vec<Arc<dyn Subscriber>>,
+        query: &[u8]                                                                    
+    ) -> Result<(bool, Option<TLObject>)> {
+        let mut queries = deserialize_bundle(query)?;
+        if queries.len() == 1 {
+            let mut query = queries.remove(0);
+            for subscriber in subscribers.iter() {
+                query = match subscriber.try_consume_query(query).await? {
+                    QueryResult::Consumed(answer) => return Ok((true, answer)),
+                    QueryResult::Rejected(query) => query,
+                    QueryResult::RejectedBundle(_) => unreachable!()
+                };
+            }
+        } else {
+            for subscriber in subscribers.iter() {
+                queries = match subscriber.try_consume_query_bundle(queries).await? {
+                    QueryResult::Consumed(answer) => return Ok((true, answer)),
+                    QueryResult::Rejected(_) => unreachable!(),
+                    QueryResult::RejectedBundle(queries) => queries
+                };
+            }
+        };
+        Ok((false, None))
     }
 
 }
@@ -668,33 +748,43 @@ pub enum QueryResult {
     RejectedBundle(Vec<TLObject>)            
 }
 
-impl QueryResult {
-    /// Consume helper
+impl QueryResult {                        
+
+    /// Consume plain helper
     pub fn consume<A: IntoBoxed>(answer: A) -> Result<Self> 
         where <A as IntoBoxed>::Boxed: Send + Sync + serde::Serialize + 'static 
     {
         Ok(QueryResult::Consumed(Some(TLObject::new(answer.into_boxed()))))
     }
+
+    /// Consume boxed helper
+    pub fn consume_boxed<A>(answer: A) -> Result<Self> 
+        where A: BoxedSerialize + Send + Sync + serde::Serialize + 'static
+    {
+        Ok(QueryResult::Consumed(Some(TLObject::new(answer))))
+    }
+
 }
 
 /// ADNL subscriber
+#[async_trait::async_trait]
 pub trait Subscriber: Send + Sync {
     /// Try consume custom data: data -> consumed yes/no
-    fn try_consume_custom(&self, _data: &[u8]) -> Result<bool> {
+    async fn try_consume_custom(&self, _data: &[u8], _peers: &AdnlPeers) -> Result<bool> {
         Ok(false)
     }
     /// Try consume query: object -> result
-    fn try_consume_query(&self, object: TLObject) -> Result<QueryResult> {
+    async fn try_consume_query(&self, object: TLObject) -> Result<QueryResult> {
         Ok(QueryResult::Rejected(object))
     }
     /// Try consume query bundle: objects -> result
-    fn try_consume_query_bundle(&self, objects: Vec<TLObject>) -> Result<QueryResult> {
+    async fn try_consume_query_bundle(&self, objects: Vec<TLObject>) -> Result<QueryResult> {
         Ok(QueryResult::RejectedBundle(objects))
     }
 }
 
 /// Network timeouts
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 pub struct Timeouts {
     read:  Duration,
     write: Duration
@@ -751,27 +841,107 @@ impl UpdatedAt {
     }
 }
 
+pub struct Wait<T> {
+    count: AtomicUsize,  
+    queue_sender: tokio::sync::mpsc::UnboundedSender<Option<T>>
+}
+
+impl <T> Wait<T> {
+
+    pub fn new() -> (Arc<Self>, tokio::sync::mpsc::UnboundedReceiver<Option<T>>) {
+        let (queue_sender, queue_reader) = tokio::sync::mpsc::unbounded_channel(); 
+        let ret = Self {
+            count: AtomicUsize::new(0), 
+            queue_sender
+        };
+        (Arc::new(ret), queue_reader)
+    }
+
+    pub fn count(&self) -> usize {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    pub fn request(&self) -> usize {
+        self.count.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn respond(&self, val: Option<T>) {
+        match self.queue_sender.send(val) {
+            Ok(()) => (),
+            Err(tokio::sync::mpsc::error::SendError(_)) => ()
+        }
+    }
+
+    pub async fn wait(
+        &self, 
+        queue_reader: &mut tokio::sync::mpsc::UnboundedReceiver<Option<T>>,
+        only_one: bool
+    ) -> Option<Option<T>> {
+        let mut empty = self.count.load(Ordering::Relaxed) == 0;
+        let mut ret = None;
+        if !empty {
+            ret = queue_reader.recv().await;
+            match ret {   
+                Some(ref item) => {
+                    self.count.fetch_sub(1, Ordering::Relaxed);
+                    if item.is_some() && only_one {
+                        empty = true
+                    }
+                },
+                None => empty = true
+            }
+        }
+        if empty { 
+            // Graceful close
+            queue_reader.close();
+            while let Some(_) = queue_reader.recv().await {
+            }
+        }
+        ret
+    }
+
+}
+
 /// Add object to map
 pub fn add_object_to_map<K: Hash + Ord, V>(
     to: &lockfree::map::Map<K, V>, 
     key: K, 
-    mut with: impl FnMut() -> Result<V>
+    mut factory: impl FnMut() -> Result<V>
+) -> Result<bool> {
+    add_object_to_map_with_update(
+        to,
+        key,
+        |found| if found.is_some() {
+            Ok(None)
+        } else {
+            Ok(Some(factory()?))
+        }
+    )
+}
+
+/// Add or update object in map
+pub fn add_object_to_map_with_update<K: Hash + Ord, V>(
+    to: &lockfree::map::Map<K, V>, 
+    key: K, 
+    mut factory: impl FnMut(Option<&V>) -> Result<Option<V>>
 ) -> Result<bool> {
     let mut error = None; 
     let insertion = to.insert_with(
         key,
-        |_, inserted, found| if found.is_some() {
-            lockfree::map::Preview::Discard
-        } else if inserted.is_some() {
-            lockfree::map::Preview::Keep
-        } else {
-            match with() {
-                Err(err) => {
-                    error = Some(err);
-                    lockfree::map::Preview::Discard
-                },
-                Ok(value) => lockfree::map::Preview::New(value)
+        |_, inserted, found| {
+            let found = if let Some((_, found)) = found {
+                Some(found)
+            } else if inserted.is_some() {
+                return lockfree::map::Preview::Keep
+            } else {
+                None
+            };
+            match factory(found) {
+                Err(err) => error = Some(err),
+                Ok(Some(value)) => return lockfree::map::Preview::New(value),
+                _ => ()
             }
+            lockfree::map::Preview::Discard
         }
     );
     match insertion {
@@ -781,9 +951,7 @@ pub fn add_object_to_map<K: Hash + Ord, V>(
         } else {
             Ok(false)
         },
-        lockfree::map::Insertion::Updated(_) => fail!(
-            "INTERNAL ERROR: mismatch when put object into map"
-        )
+        lockfree::map::Insertion::Updated(_) => Ok(true)
     }
 }
 

@@ -1,7 +1,7 @@
 use crate::{
     dump, 
     common::{
-        AdnlHandshake, AdnlStream, AdnlStreamCrypto, deserialize, KeyId, 
+        AdnlHandshake, AdnlPingSubscriber, AdnlStream, AdnlStreamCrypto, deserialize, KeyId, 
         KeyOption, KeyOptionJson, Query, serialize_inplace, Subscriber, TARGET, Timeouts
     }
 };
@@ -16,14 +16,23 @@ use ton_types::{fail, Result};
 /// ADNL server configuration
 pub struct AdnlServerConfig {
     address: SocketAddr,
-    keys: Arc<lockfree::map::Map<Arc<KeyId>, Arc<KeyOption>>>,
+    clients: Arc<Option<lockfree::map::Map<[u8; 32], u8>>>,
+    server_key: Arc<lockfree::map::Map<Arc<KeyId>, Arc<KeyOption>>>,
     timeouts: Timeouts
 }
 
-#[derive(serde::Deserialize)]
-struct AdnlServerConfigJson {
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum AdnlServerClients {
+    Any,
+    List(Vec<KeyOptionJson>)
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+pub struct AdnlServerConfigJson {
     address: String,
-    keys: Vec<KeyOptionJson>,
+    clients: AdnlServerClients,
+    server_key: KeyOptionJson,
     timeouts: Option<Timeouts>
 }
 
@@ -32,19 +41,34 @@ impl AdnlServerConfig {
     /// Costructs from JSON data
     pub fn from_json(json: &str) -> Result<Self> {
         let json_config: AdnlServerConfigJson = serde_json::from_str(json)?;
-        let keys = lockfree::map::Map::new();
-        for key in json_config.keys.iter() {
-            let key = KeyOption::from_private_key(key)?;
-            let id = key.id().clone();
-            if keys.insert(id.clone(), Arc::new(key)).is_some() {
-                fail!("Duplicated key {} in server configuration", id)
+        Self::from_json_config(&json_config)
+    }
+
+    /// Construct from JSON config structure
+    pub fn from_json_config(json_config: &AdnlServerConfigJson) -> Result<Self> {
+        let key = KeyOption::from_private_key(&json_config.server_key)?;
+        let server_key = lockfree::map::Map::new();
+        server_key.insert(key.id().clone(), Arc::new(key));
+        let clients = match &json_config.clients {
+            AdnlServerClients::Any => None,
+            AdnlServerClients::List(list) => {
+                let clients = lockfree::map::Map::new();
+                for key in list.iter() {
+                    let key = KeyOption::from_public_key(key)?;
+                    let key = key.pub_key()?;
+                    if clients.insert(key.clone(), 0).is_some() {
+                        fail!("Duplicated client key {} in server config", base64::encode(key))
+                    }
+                }
+                Some(clients)
             }
-        }
+        };
         let ret = AdnlServerConfig {
             address: json_config.address.parse()?,
-            keys: Arc::new(keys),
-            timeouts: if let Some(timeouts) = json_config.timeouts {
-                timeouts
+            clients: Arc::new(clients),
+            server_key: Arc::new(server_key),
+            timeouts: if let Some(timeouts) = &json_config.timeouts {
+                timeouts.clone()
             } else {
                 Timeouts::default()
             }
@@ -70,10 +94,11 @@ impl AdnlServerThread {
         subscribers: Arc<Vec<Arc<dyn Subscriber>>>
     ) {
         let stream = AdnlStream::from_stream_with_timeouts(stream, config.timeouts());
-        let keys = config.keys.clone();
+        let clients = config.clients.clone();
+        let key = config.server_key.clone();
         tokio::spawn(
             async move {
-                if let Err(e) = AdnlServerThread::run(stream, &keys, subscribers).await {
+                if let Err(e) = AdnlServerThread::run(stream, key, clients, subscribers).await {
                     log::warn!(target: TARGET, "ERROR --> {}", e);
                     return;
                 }
@@ -84,12 +109,22 @@ impl AdnlServerThread {
 
     async fn run(
         mut stream: AdnlStream,
-        keys: &Arc<lockfree::map::Map<Arc<KeyId>, Arc<KeyOption>>>,
+        key: Arc<lockfree::map::Map<Arc<KeyId>, Arc<KeyOption>>>,
+        clients: Arc<Option<lockfree::map::Map<[u8; 32], u8>>>,
         subscribers: Arc<Vec<Arc<dyn Subscriber>>>
     ) -> Result<()> {
         let mut buf = Vec::with_capacity(256);
         stream.read(&mut buf, 256).await?;
-        let mut crypto = Self::parse_init_packet(&keys, &mut buf)?;
+        if let Some(clients) = clients.as_ref() {
+            // Check known client if any 
+            if buf.len() < 64 {
+                fail!("ADNL init message is too short ({})", buf.len())
+            }
+            if !clients.iter().any(|client| &buf[32..64] == client.key()) {
+                fail!("Message from unknown client {}", base64::encode(&buf[32..64]))
+            }
+        }
+        let mut crypto = Self::parse_init_packet(&key, &mut buf)?;
         buf.truncate(0);
         crypto.send(&mut stream, &mut buf).await?;
         loop {
@@ -98,10 +133,8 @@ impl AdnlServerThread {
                 .downcast::<AdnlMessage>()
                 .map_err(|msg| failure::format_err!("Unsupported ADNL message {:?}", msg))?;
             let (consumed, reply) = match &msg {
-                AdnlMessage::Adnl_Message_Custom(custom) => 
-                    (Query::process_custom(&subscribers, &custom)?, None),
                 AdnlMessage::Adnl_Message_Query(query) => 
-                    Query::process(&subscribers, &query)?,
+                    Query::process_adnl(&subscribers, &query).await?,
                 _ => (false, None)                
             };
             if consumed {
@@ -116,10 +149,10 @@ impl AdnlServerThread {
     }
 
     fn parse_init_packet(
-        keys: &lockfree::map::Map<Arc<KeyId>, Arc<KeyOption>>,
+        key: &lockfree::map::Map<Arc<KeyId>, Arc<KeyOption>>,
         buf: &mut Vec<u8>
     ) -> Result<AdnlStreamCrypto> {
-        AdnlHandshake::parse_packet(&keys, buf, Some(160))?;
+        AdnlHandshake::parse_packet(key, buf, Some(160))?;
         dump!(trace, TARGET, "Nonce", &buf[..160]);
         let ret = AdnlStreamCrypto::with_nonce_as_server(
             arrayref::array_mut_ref!(buf, 0, 160)
@@ -138,7 +171,7 @@ impl AdnlServer {
     /// Listen to connections
     pub async fn listen(
         config: AdnlServerConfig, 
-        subscribers: Vec<Arc<dyn Subscriber>>
+        mut subscribers: Vec<Arc<dyn Subscriber>>
     ) -> Result<Self> {
         let (trigger, tripwire) = stream_cancel::Tripwire::new();
 /*
@@ -153,11 +186,12 @@ impl AdnlServer {
         socket.bind(&addr)?;
         let mut listener = tokio::net::TcpListener::from_std(socket.into_tcp_listener())?;
 */
+        subscribers.push(Arc::new(AdnlPingSubscriber));
         let subscribers = Arc::new(subscribers);
         let mut listener = tokio::net::TcpListener::bind(config.address).await?;
         tokio::spawn(
             async move {
-                let mut incoming = listener.incoming().take_until(tripwire);
+                let mut incoming = listener.incoming().take_until_if(tripwire);
                 loop {
                     match incoming.next().await {
                         Some(Err(e)) =>
