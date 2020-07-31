@@ -1,13 +1,13 @@
-	use crate::{
+use crate::{
     from_slice, 
     common::{
-        add_object_to_map, AdnlCryptoUtils, AdnlHandshake, AdnlPingSubscriber, deserialize, 
-        get256, hash, KeyId, KeyOption, KeyOptionJson, Query, QueryCache, QueryId, serialize, 
-        Subscriber, TARGET, UpdatedAt, Version
+        add_object_to_map, AdnlCryptoUtils, AdnlHandshake, AdnlPeers, AdnlPingSubscriber, 
+        deserialize, get256, hash, KeyId, KeyOption, KeyOptionJson, Query, QueryCache, 
+        QueryId, serialize, Subscriber, TARGET, UpdatedAt, Version
     }
 };
 use aes_ctr::stream_cipher::SyncStreamCipher;
-use core::sync::atomic::{self, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize};
+use core::sync::atomic::{self, AtomicI32, AtomicU32, AtomicU64, AtomicUsize};
 use rand::Rng;
 use sha2::Digest;
 use std::{
@@ -27,7 +27,7 @@ use ton_api::{
         pub_::publickey::Aes as AesKey
     }
 };
-use ton_types::{fail, Result};
+use ton_types::{error, fail, Result};
 
 #[macro_export]
 macro_rules! adnl_node_compatibility_key {
@@ -94,8 +94,9 @@ macro_rules! adnl_node_test_config {
 }
 
 /// ADNL addresses cache iterator
+#[derive(Debug)]
 pub struct AddressCacheIterator(u32);
-    
+
 /// ADNL addresses cache
 pub struct AddressCache {
     cache: lockfree::map::Map<Arc<KeyId>, u32>,
@@ -105,8 +106,6 @@ pub struct AddressCache {
 }
 
 impl AddressCache {
-
-    const STATE_WRAPPED: u32 = 0x80000000;
 
     pub fn with_limit(limit: u32) -> Self {
         Self {
@@ -142,6 +141,11 @@ impl AddressCache {
         (AddressCacheIterator(0), self.find_by_index(0))
     }
 
+    pub fn given(&self, iter: &AddressCacheIterator) -> Option<Arc<KeyId>> {
+        let AddressCacheIterator(ref index) = iter;
+        self.find_by_index(*index)
+    }
+
     pub fn next(&self, iter: &mut AddressCacheIterator) -> Option<Arc<KeyId>> {
         let AddressCacheIterator(ref mut index) = iter;
         self.find_by_index({*index += 1; *index})
@@ -153,15 +157,13 @@ impl AddressCache {
             &self.cache,
             address.clone(),
             || {
-                // We do not expect many parallel additions to overflow the limit
-                // If limit was exceeded, carefully restore the proper upper
-                let marker = self.upper.fetch_add(1, atomic::Ordering::Relaxed);
-                index = marker & !Self::STATE_WRAPPED;
+                let upper = self.upper.fetch_add(1, atomic::Ordering::Relaxed);
+                index = upper;
                 if index >= self.limit {
-                    index -= self.limit;
+                    index %= self.limit;
                     self.upper.compare_and_swap(
-                        marker + 1, 
-                        index | Self::STATE_WRAPPED, 
+                        upper + 1, 
+                        index, 
                         atomic::Ordering::Relaxed
                     );
                 }
@@ -169,7 +171,14 @@ impl AddressCache {
             }
         )?;
         if ret {
-            self.index.insert(index, address);
+            if let Some(index) = self.index.insert(index, address) {
+                self.cache.remove_with(
+                    index.val(),
+                    |&(_, val)| {
+                        &val == index.key()
+                    } 
+                );
+            }
         }
         Ok(ret)
     }
@@ -184,7 +193,10 @@ impl AddressCache {
     }
 
     pub fn random_set(&self, dst: &AddressCache, mut n: u32) -> Result<()> {
-        n = min(self.count(), n);
+        if dst.count() >= self.count() {
+            return Ok(())
+        }
+        n = min(self.count() - dst.count(), n);
         while n > 0 {
             if let Some(key_id) = self.random() {
                 if dst.put(key_id)? {
@@ -211,6 +223,7 @@ impl AddressCache {
 struct AdnlChannel {
     local_key: Arc<KeyId>,
     other_key: Arc<KeyId>,
+    drop: AtomicU32,
     recv: ChannelSide,
     send: ChannelSide
 }
@@ -255,6 +268,7 @@ impl AdnlChannel {
             Self { 
                 local_key: local_key.clone(), 
                 other_key: other_key.clone(), 
+                drop: AtomicU32::new(0),
                 recv: Self::build_side(fwd_secret)?,
                 send: Self::build_side(rev_secret)?
             }
@@ -339,7 +353,6 @@ impl AdnlNodeAddress {
 }
 
 /// ADNL node configuration
-#[derive(Debug)]
 pub struct AdnlNodeConfig {
     ip_address: IpAddress,
     tags: lockfree::map::Map<usize, Arc<KeyId>>,
@@ -489,6 +502,14 @@ impl IpAddress {
         }
     }
 
+    /// Convert to UDP data
+    pub fn into_udp(&self) -> Udp {
+        Udp {
+            ip: self.ip() as i32,
+            port: self.port() as i32
+        }
+    }
+
     fn from_ip_and_port(ip: u32, port: u16) -> Self {
         Self(((ip as u64) << 16) | port as u64)
     }
@@ -539,31 +560,131 @@ struct Peer {
 
 struct PeerState {
     reinit_date: AtomicI32,
-    seqno: AtomicI64
+    seqno: AtomicU64,
+    window: Option<AtomicU64>
 }
 
 impl PeerState {
-    fn with_reinit_date(reinit_date: i32) -> Self {
+
+    const WINDOW: i8 = 32;
+    const MARKER: i8 = 64 - Self::WINDOW;
+
+    fn for_receive_with_reinit_date(reinit_date: i32) -> Self {
         Self {
             reinit_date: AtomicI32::new(reinit_date),
-            seqno: AtomicI64::new(0)    
+            seqno: AtomicU64::new(0),
+            window: Some(AtomicU64::new(0))
         }
     }
-    fn next_seqno(&self) -> i64 {
+
+    fn for_send() -> Self {
+        Self {
+            window: None,
+            reinit_date: AtomicI32::new(0),
+            seqno: AtomicU64::new(0)    
+        }
+    }
+
+    fn load_seqno(&self) -> u64 {
         self.seqno.fetch_add(1, atomic::Ordering::Relaxed) + 1
     }
     fn reinit_date(&self) -> i32 {
         self.reinit_date.load(atomic::Ordering::Relaxed)
     }
-    fn seqno(&self) -> i64 {
-        self.seqno.load(atomic::Ordering::Relaxed)
-    }
-    fn set_reinit_date(&self, reinit_date: i32) {
+    fn reset_reinit_date(&self, reinit_date: i32) {
         self.reinit_date.store(reinit_date, atomic::Ordering::Relaxed)
     }
-    fn set_seqno(&self, seqno: i64) {
-        self.seqno.store(seqno, atomic::Ordering::Relaxed)
+    fn reset_seqno(&self, seqno: u64) {
+        self.seqno.store(seqno, atomic::Ordering::Relaxed);
+        if let Some(window) = &self.window {
+            window.store(seqno as u32 as u64, atomic::Ordering::Relaxed)
+        }
     }
+    fn seqno(&self) -> u64 {
+        self.seqno.load(atomic::Ordering::Relaxed)
+    }
+
+    fn save_seqno(&self, seqno: u64) -> Result<()> {
+        let window = self.window.as_ref().ok_or_else(
+            || error!("INTERNAL ERROR: unexpected save_seqno() call")
+        )?;
+        loop {
+            let old_seqno = self.seqno.load(atomic::Ordering::Relaxed);
+            match Self::evaluate(old_seqno, seqno, false)? {
+                // Older packet
+                x if x < 0 => {
+                    let mask = window.load(atomic::Ordering::Relaxed);
+                    if mask as u32 != old_seqno as u32 {
+                        // Re-read state
+                        continue
+                    } 
+                    let bit = 1u64 << (-x + Self::MARKER);
+                    if mask & bit != 0 {
+                        // Already received
+                        fail!("ADNL packet with seqno {} already received {:x}", seqno, mask)  
+                    }
+                    if !Self::try_set(window, mask, mask | bit) {
+                        // Re-read state
+                        continue
+                    }
+                },
+                // Newer packet
+                _ => {
+                    if !Self::try_set(&self.seqno, old_seqno, seqno) {
+                        // Re-read state
+                        continue
+                    }
+                    loop {
+                        let mask = window.load(atomic::Ordering::Relaxed);
+                        let new_mask = match Self::evaluate(mask, seqno, true)? {
+                            x if x < 0 => mask | (1u64 << (-x + Self::MARKER)),
+                            x => (seqno as u32) as u64 | (1u64 << Self::MARKER) | 
+                            if x >= Self::WINDOW {
+                                0
+                            } else {
+                                (mask & 0xFFFFFFFF00000000u64) << x
+                            } 
+                        };
+                        if Self::try_set(window, mask, new_mask) {
+                            break
+                        }
+                    } 
+                }
+            }
+            break
+        }
+        Ok(())
+    }
+
+    fn evaluate(old: u64, new: u64, as_window: bool) -> Result<i8> {
+        let diff = if as_window {
+            (new as u32 as i64 - old as u32 as i64) as i32
+        } else {
+            let diff = new as i64 - old as i64;
+            if diff >= (1i64 << Self::MARKER) {
+                fail!("ADNL packet with seqno {} is too new ({})", new, old)
+            }
+            diff as i32
+        };
+        match diff {
+            // Already received
+            0 => fail!("ADNL packet with seqno {} just received", new),
+            // Too late
+            x if x <= -Self::WINDOW as i32 => 
+                fail!("ADNL packet with seqno {} is too old ({})", new, old),
+            // Not too late
+            x if x < 0 => Ok(x as i8),
+            // Just update
+            x => Ok(min(x, Self::WINDOW as i32) as i8)
+        }
+    }
+
+    fn try_set(atomic: &AtomicU64, old: u64, new: u64) -> bool {
+        atomic
+            .compare_exchange(old, new, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
+            .is_ok()
+    }
+
 }
 
 #[derive(Debug)]
@@ -574,7 +695,7 @@ struct SendJob {
 
 struct Transfer {
     data: lockfree::map::Map<usize, Vec<u8>>,
-    received: AtomicUsize,
+    received: 	AtomicUsize,
     total: usize,
     updated: UpdatedAt
 }
@@ -601,9 +722,13 @@ pub struct AdnlNode {
 
 impl AdnlNode {
 
-    const CLOCK_TOLERANCE: i32 = 60;   // Seconds
-    const TIMEOUT_ADDRESS: i32 = 1000; // Seconds
-    const TIMEOUT_TRANSFER: u64 = 3;   // Seconds
+    const CLOCK_TOLERANCE: i32 = 60;     // Seconds
+    const MAX_QUERY_DROPS: u32 = 10;    
+    const SIZE_BUFFER: usize = 2048;
+    const TIMEOUT_ADDRESS: i32 = 1000;   // Seconds
+    const TIMEOUT_QUERY_MIN: u64 = 500;  // Milliseconds
+    const TIMEOUT_QUERY_MAX: u64 = 5000; // Milliseconds
+    const TIMEOUT_TRANSFER: u64 = 3;     // Seconds
 
     /// Constructor
     pub async fn with_config(mut config: AdnlNodeConfig) -> Result<Arc<Self>> {
@@ -664,17 +789,42 @@ impl AdnlNode {
             )
             .await?
             .split();
-        let node_receiver = node.clone();
+        let node = node.clone();
         subscribers.push(Arc::new(AdnlPingSubscriber));
         tokio::spawn(
             async move {
-                loop {                  
-                    if let Err(e) = node_receiver.receive(
-                        &mut receiver, 
-                        &subscribers, 
-                    ).await {
-                        log::warn!(target: TARGET, "ERROR <-- {}", e)
-                    }
+                let mut buf_source = None;
+                let subscribers = Arc::new(subscribers);
+                loop {            
+                    let buf = buf_source.get_or_insert_with(
+                        || {
+                            let mut buf = Vec::with_capacity(Self::SIZE_BUFFER);
+                            buf.resize(Self::SIZE_BUFFER, 0);
+                            buf                                                       
+                        }
+                    );
+                    let len = match receiver.recv_from(&mut buf[..]).await {
+                        Err(e) => {
+                            log::warn!(target: TARGET, "ERROR <-- {}", e);
+                            continue
+                        },
+                        Ok((len, _)) => len
+                    };
+                    let mut buf = if let Some(buf) = buf_source.take() {
+                        buf
+                    } else {
+                        continue
+                    };
+                    buf.truncate(len);
+                    let node = node.clone();
+                    let subscribers = subscribers.clone();
+                    tokio::spawn (
+                        async move {
+                            if let Err(e) = node.receive(&mut buf, &subscribers).await {
+                                log::warn!(target: TARGET, "ERROR <-- {}", e)
+                            }
+                        }
+                    );
                 }
             }
         );
@@ -689,22 +839,28 @@ impl AdnlNode {
         );
         Ok(())
     }       
-
+    
     /// Add peer 
     pub fn add_peer(
         &self, 
         local_key: &Arc<KeyId>, 
         peer_ip_address: &IpAddress, 
         peer_key: &Arc<KeyOption>
-    ) -> Result<Arc<KeyId>> {
+    ) -> Result<Option<Arc<KeyId>>> {
+        if peer_key.id() == local_key {
+            return Ok(None)
+        }
         let IpAddress(peer_ip_address) = peer_ip_address;
         let mut error = None;
-        self.peers(local_key)?.insert_with(
-            peer_key.id().clone(), 
-            |_, inserted, found| if let Some((_, found)) = found {
+        let mut ret = peer_key.id().clone();
+        let result = self.peers(local_key)?.insert_with(
+            ret.clone(), 
+            |key, inserted, found| if let Some((_, found)) = found {
+                ret = key.clone();
                 found.address.ip_address.store(*peer_ip_address, atomic::Ordering::Relaxed);
                 lockfree::map::Preview::Discard
             } else if inserted.is_some() {
+                ret = key.clone(); 
                 lockfree::map::Preview::Keep
             } else {
                 let address = AdnlNodeAddress::from_ip_address_and_key(
@@ -715,8 +871,8 @@ impl AdnlNode {
                     Ok(address) => lockfree::map::Preview::New(
                         Peer {
                             address,
-                            recv_state: PeerState::with_reinit_date(self.start_time),
-                            send_state: PeerState::with_reinit_date(0)
+                            recv_state: PeerState::for_receive_with_reinit_date(self.start_time),
+                            send_state: PeerState::for_send()
                         }
                     ),
                     Err(err) => {
@@ -727,22 +883,25 @@ impl AdnlNode {
             }
         );
         if let Some(error) = error {
-            Err(error)
-        } else {
-            Ok(peer_key.id().clone())
+            return Err(error)
+        } 
+        if let lockfree::map::Insertion::Created = result {
+            log::debug!(
+                target: TARGET, 
+                "Added ADNL peer with keyID {}, key {} to {}", 
+                base64::encode(peer_key.id().data()),
+                base64::encode(peer_key.pub_key()?),
+                base64::encode(local_key.data())
+            )
         }
+        Ok(Some(ret))
     }
 
     /// Build address list for given node
     pub fn build_address_list(&self, reinit_date: i32) -> Result<AddressList> {
         let version = Version::get();
         let ret = AddressList {
-            addrs: vec![
-                Udp {
-                    ip: self.config.ip_address.ip() as i32,
-                    port: self.config.ip_address.port() as i32
-                }.into_boxed()
-            ].into(),
+            addrs: vec![self.config.ip_address.into_udp().into_boxed()].into(),
             version,
             reinit_date: if reinit_date == 0 {
                 version
@@ -753,6 +912,16 @@ impl AdnlNode {
             expire_at: version + Self::TIMEOUT_ADDRESS
         };
         Ok(ret)
+    }
+
+    /// Calculate timeout from roundtrip, milliseconds
+    pub fn calc_timeout(roundtrip: Option<u64>) -> u64 {
+        let timeout = roundtrip.unwrap_or(Self::TIMEOUT_QUERY_MAX);
+        if timeout < Self::TIMEOUT_QUERY_MIN {
+            Self::TIMEOUT_QUERY_MIN
+        } else {
+            timeout
+        }
     }
 
     /// Node IP address
@@ -782,42 +951,45 @@ impl AdnlNode {
         if (list.expire_at != 0) && (list.expire_at < version) {
             fail!("Address list is expired")
         }
-        let ret = IpAddress::from_ip_and_port(
-            match &list.addrs[0] {
-                Address::Adnl_Address_Udp(x) => x.ip as u32,
-                _ => fail!("IPv6 addresses are not supported")
-            },            
-            *list.addrs[0].port() as u16
-        );
+        let ret = match &list.addrs[0] {
+            Address::Adnl_Address_Udp(x) => IpAddress::from_ip_and_port(
+                x.ip as u32,
+                x.port as u16
+            ),
+            _ => fail!("Only IPv4 address format is supported")
+        };
         Ok(ret)
     }
 
     /// Send query
     pub async fn query(
         &self, 
-        dst: &Arc<KeyId>, 
-        src: &Arc<KeyId>,
-        query: &TLObject
+        query: &TLObject,
+        peers: &AdnlPeers,
+        timeout: Option<u64>
     ) -> Result<Option<TLObject>> {
-        self.query_with_prefix(dst, src, None, query).await
+        self.query_with_prefix(None, query, peers, timeout).await
     }
 
     /// Send query with prefix
     pub async fn query_with_prefix(
         &self, 
-        dst: &Arc<KeyId>, 
-        src: &Arc<KeyId>,
         prefix: Option<&[u8]>,
-        query: &TLObject
+        query: &TLObject,
+        peers: &AdnlPeers,
+        timeout: Option<u64>
     ) -> Result<Option<TLObject>> {
         let (query_id, msg) = Query::build(prefix, query)?;
         let (ping, query) = Query::new();
         self.queries.insert(query_id, query);
-        self.send_message(dst, src, msg)?;
+log::warn!("Sent query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], query_id[2], query_id[3]);
+        let channel = self.channels_send.get(peers.other());
+        self.send_message(msg, peers)?;
         let queries = self.queries.clone();
         tokio::spawn(
             async move {
-                tokio::time::delay_for(Duration::from_millis(Query::TIMEOUT)).await;
+                let timeout = timeout.unwrap_or(Self::TIMEOUT_QUERY_MAX);
+                tokio::time::delay_for(Duration::from_millis(timeout)).await;
                 if let Err(e) = Self::update_query(&queries, query_id, None).await {
                     log::warn!(target: TARGET, "ERROR: {}", e)
                 }
@@ -826,25 +998,72 @@ impl AdnlNode {
         ping.wait().await;                     
         if let Some(removed) = self.queries.remove(&query_id) {
             match removed.val() {
-                Query::Received(answer) => return Ok(Some(deserialize(answer)?)),
-                Query::Timeout => return Ok(None),
+                Query::Received(answer) => {
+                    /* Restore channel health */
+                    if let Some(channel) = channel {
+                        channel.val().drop.store(0, atomic::Ordering::Relaxed)
+                    }
+                    return Ok(Some(deserialize(answer)?))
+                },
+                Query::Timeout => {
+log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], query_id[2], query_id[3]);
+                    /* Monitor channel health */
+                    if let Some(channel) = channel {
+                        let drops = channel.val().drop.fetch_add(1, atomic::Ordering::Relaxed);
+                        if drops >= Self::MAX_QUERY_DROPS {
+                            self.reset_peers(peers)? 
+                        }
+                    }
+                    return Ok(None)
+                },
                 _ => ()
             }
         } 
         fail!("INTERNAL ERROR: ADNL query mismatch")
     }
 
+    /// Reset peers 
+    pub fn reset_peers(&self, peers: &AdnlPeers) -> Result<()> {
+        let peer_list = self.peers(peers.local())?;
+        let peer = peer_list.get(peers.other()).ok_or_else(
+            || error!("Try to reset unknown peer pair {} -> {}", peers.local(), peers.other())
+        )?;
+        let peer = peer.val();
+        let address = AdnlNodeAddress::from_ip_address_and_key(
+            IpAddress(peer.address.ip_address.load(atomic::Ordering::Relaxed)),
+            peer.address.key.clone()        
+        )?;
+        self.channels_wait
+            .remove(peers.other())
+            .or_else(|| self.channels_send.remove(peers.other()))
+            .and_then(
+                |removed| {
+                    peer_list.insert(
+                        peers.other().clone(),
+                        Peer {
+                            address,
+                            recv_state: PeerState::for_receive_with_reinit_date(
+                                peer.recv_state.reinit_date.load(atomic::Ordering::Relaxed) + 1
+                            ),
+                            send_state: PeerState::for_send()
+                        }
+                    );
+                    self.channels_recv.remove(removed.val().recv_id())
+                }
+             );
+        Ok(())
+    }
+
     /// Send custom message
     pub async fn send_custom(
         &self, 
-        dst: &Arc<KeyId>, 
-        src: &Arc<KeyId>, 
-        data: &[u8]
+        data: &[u8],
+        peers: &AdnlPeers
     ) -> Result<()> {
         let msg = AdnlCustomMessage {
             data: ton::bytes(data.to_vec())
         }.into_boxed();
-        self.send_message(dst, src, msg)
+        self.send_message(msg, peers)
     }
 
     fn check_packet(
@@ -859,11 +1078,6 @@ impl AdnlNode {
             }
             other_key.clone()
         } else if let Some(pub_key) = packet.from() {
-            let ip_address = if let Some(address) = packet.address() {
-                Self::parse_address_list(address)?
-            } else {
-                fail!("No source IP address in packet")
-            };
             let key = Arc::new(KeyOption::from_tl_public_key(pub_key)?);
             let other_key = key.id().clone();
             if let Some(id) = packet.from_short() {
@@ -871,7 +1085,10 @@ impl AdnlNode {
                     fail!("Mismatch between ID and key inside packet")
                 }
             }
-            self.add_peer(&local_key, &ip_address, &key)?;
+            if let Some(address) = packet.address() {
+                let ip_address = Self::parse_address_list(address)?;
+                self.add_peer(&local_key, &ip_address, &key)?;
+            }
             other_key
         } else if let Some(id) = packet.from_short() {
             KeyId::from_data(id.id.0)
@@ -904,9 +1121,18 @@ impl AdnlNode {
                 match dst_reinit_date.cmp(&peer.recv_state.reinit_date()) {
                     Ordering::Equal => (),                                                                                                               
                     Ordering::Greater => 
-                        fail!("Destination reinit date is too new: {}", dst_reinit_date),
+                        fail!("Destination reinit date is too new: {} vs {}, {:?}", 
+                            dst_reinit_date,
+                            peer.recv_state.reinit_date(),  
+                            packet
+                        ),
                     Ordering::Less => 
-                        fail!("Destination reinit date is too old: {}", dst_reinit_date)
+                        fail!(
+                            "Destination reinit date is too old: {} vs {}, {:?}", 
+                            dst_reinit_date, 
+                            peer.recv_state.reinit_date(),  
+                            packet
+                        )
                 }
             }
             let other_reinit_date = peer.send_state.reinit_date();
@@ -915,10 +1141,10 @@ impl AdnlNode {
                 Ordering::Greater => if *reinit_date > Version::get() + Self::CLOCK_TOLERANCE {
                     fail!("Source reinit date is too new: {}", reinit_date)
                 } else {
-                    peer.send_state.set_reinit_date(*reinit_date);
+                    peer.send_state.reset_reinit_date(*reinit_date);
                     if other_reinit_date != 0 {
-                        peer.send_state.set_seqno(0);
-                        peer.recv_state.set_seqno(0);
+                        peer.send_state.reset_seqno(0);
+                        peer.recv_state.reset_seqno(0);
                     }
                 },
                 Ordering::Less => 
@@ -926,19 +1152,62 @@ impl AdnlNode {
             }
         }
         if let Some(seqno) = packet.seqno() {
-            let local_seqno = peer.recv_state.seqno();
-            if seqno <= &local_seqno {
-                fail!("Too old seqno received: {}, expected > {}", seqno, local_seqno)
+            if let Err(e) = peer.recv_state.save_seqno(*seqno as u64) {
+                fail!("Peer {} ({:?}): {}", ret, other_key, e)
             }
-            peer.recv_state.set_seqno(*seqno);
         }
         if let Some(seqno) = packet.confirm_seqno() {
             let local_seqno = peer.send_state.seqno();
-            if seqno > &local_seqno {
-                fail!("Too new seqno confirmed: {}, expected {} <= ", seqno, local_seqno)
+            if *seqno as u64 > local_seqno {
+                fail!(
+                    "Peer {}: too new ADNL packet seqno confirmed: {}, expected <= {}", 
+                    ret,
+                    seqno, 
+                    local_seqno
+                )
             }
         }
         Ok(ret)	
+    }
+
+    fn create_channel(
+        &self, 
+        peers: &AdnlPeers, 
+        local_pub: &mut Option<[u8; 32]>,
+        other_pub: &[u8; 32],
+        context: &str
+    ) -> Result<Arc<AdnlChannel>> {
+        let local_key = peers.local();
+        let other_key = peers.other();
+        let peer = self.peers(local_key)?; 
+        let peer = if let Some(peer) = peer.get(other_key) {
+            peer
+        } else {
+            fail!("Channel {} with unknown peer {} -> {}", context, local_key, other_key)
+        };
+        let local_pvt_key = &peer.val().address.channel_key;
+        let local_pub_key = local_pvt_key.pub_key()?;
+        if let Some(ref local_pub) = local_pub {
+            if local_pub_key != local_pub {
+                fail!(
+                    "Mismatch in key for channel {}\n{} / {}",
+                    context,
+                    base64::encode(local_pub_key), 
+                    base64::encode(other_pub)
+                )
+            }
+        } else {
+            local_pub.replace(local_pub_key.clone());
+        }
+        let channel = AdnlChannel::with_keys(local_key, local_pvt_key, other_key, other_pub)?;
+        log::debug!(target: TARGET, "Channel {}: {} -> {}", context, local_key, other_key);
+        log::trace!(
+            target: TARGET,
+            "Channel send ID {}, recv ID {}", 
+            base64::encode(channel.send_id()),
+            base64::encode(channel.recv_id())
+        );
+        Ok(Arc::new(channel))
     }
 
     fn gen_rand() -> Vec<u8> {  
@@ -961,8 +1230,7 @@ impl AdnlNode {
         &self,
         subscribers: &Vec<Arc<dyn Subscriber>>,
         msg: &AdnlMessage,
-        local_key: &Arc<KeyId>,
-        other_key: &Arc<KeyId>
+        peers: &AdnlPeers
     ) -> Result<()> {
         let new_msg = if let AdnlMessage::Adnl_Message_Part(part) = msg {
             add_object_to_map(
@@ -1019,90 +1287,54 @@ impl AdnlNode {
             AdnlMessage::Adnl_Message_Answer(answer) => {
                 let query_id = answer.query_id.0;
                 if !Self::update_query(&self.queries, query_id, Some(&answer.answer)).await? {
-                    fail!("Received answer to unknown query {:?}", answer)
+                    fail!("Received answer from {} to unknown query {:?}", peers.other(), answer)
                 }
                 None
             },
             AdnlMessage::Adnl_Message_ConfirmChannel(confirm) => {
-                let peer = self.peers(local_key)?; 
-                let peer = if let Some(peer) = peer.get(other_key) {
-                    peer
-                } else {
-                    fail!("Unexpected channel confirmation {} -> {}", local_key, other_key)
-                };
-                let local_pvt_key = &peer.val().address.channel_key;
-                let local_pub_key = local_pvt_key.pub_key()?;
-                let other_pub_key = get256(&confirm.key);
-                if local_pub_key != get256(&confirm.peer_key) {
-                    fail!(
-                        "Mismatch in key for channel confirmation \n{} / {}",
-                        base64::encode(local_pub_key), 
-                        base64::encode(other_pub_key)
-                    )
-                }
-                let channel = AdnlChannel::with_keys(
-                    local_key, 
-                    local_pvt_key, 
-                    other_key, 
-                    other_pub_key
+                let mut local_pub = Some(get256(&confirm.peer_key).clone());
+                let channel = self.create_channel(
+                    peers, 
+                    &mut local_pub, 
+                    get256(&confirm.key), 
+                    "confirmation"
                 )?;
-                let channel = Arc::new(channel);
-                log::debug!(
-                    target: TARGET, 
-                    "Channel confirmed {} ({}) -> {} ({})", 
-                    local_key, 
-                    base64::encode(channel.send_id()),
-                    other_key,
-                    base64::encode(channel.recv_id())
-                );
-                self.channels_send.insert(other_key.clone(), channel.clone());
+                self.channels_send.insert(peers.other().clone(), channel.clone());
                 self.channels_recv.insert(channel.recv_id().clone(), channel);
                 None
             },
             AdnlMessage::Adnl_Message_CreateChannel(create) => {
-                let peer = self.peers(local_key)?;
-                let peer = if let Some(peer) = peer.get(other_key) {
-                    peer
-                } else {
-                    fail!("INTERNAL ERROR: unknown peer {} for {}", other_key, local_key)
-                };
-                let local_pvt_key = &peer.val().address.channel_key;
-                let local_pub_key = local_pvt_key.pub_key()?;
-                let channel = AdnlChannel::with_keys(
-                    local_key, 
-                    local_pvt_key, 
-                    other_key, 
-                    get256(&create.key)
+                let mut local_pub = None;
+                let channel = self.create_channel(
+                    peers, 
+                    &mut local_pub, 
+                    get256(&create.key), 
+                    "creation"
                 )?;
-                let channel = Arc::new(channel);
-                log::debug!(
-                    target: TARGET, 
-                    "Channel created {} ({}) -> {} ({})", 
-                    other_key, 
-                    base64::encode(channel.recv_id()),
-                    local_key,
-                    base64::encode(channel.send_id())
-                );
+                let msg = if let Some(local_pub) = local_pub {
+                    ConfirmChannel {
+                        key: ton::int256(local_pub),
+                        peer_key: create.key,
+                        date: create.date
+                    }.into_boxed()
+                } else {
+                    fail!("INTERNAL ERROR: local key mismatch in channel creation")
+                };
                 self.channels_wait
-                    .insert(other_key.clone(), channel.clone())
-                    .or(self.channels_send.remove(other_key))
+                    .insert(peers.other().clone(), channel.clone())
+                    .or(self.channels_send.remove(peers.other()))
                     .and_then(|removed| self.channels_recv.remove(removed.val().recv_id()));
                 self.channels_recv.insert(channel.recv_id().clone(), channel);
-                let msg = ConfirmChannel {
-                    key: ton::int256(local_pub_key.clone()),
-                    peer_key: create.key,
-                    date: create.date
-                }.into_boxed();
                 Some(msg)
             },
             AdnlMessage::Adnl_Message_Custom(custom) => {
-                if !Query::process_custom(subscribers, custom)? {
+                if !Query::process_custom(subscribers, custom, peers).await? {
                     fail!("No subscribers for custom message {:?}", custom)
                 }
                 None
             },
             AdnlMessage::Adnl_Message_Query(query) => {
-                if let (true, answer) = Query::process(subscribers, query)? {
+                if let (true, answer) = Query::process_adnl(subscribers, query).await? {
                     answer
                 } else {
                     fail!("No subscribers for query {:?}", query)
@@ -1111,30 +1343,25 @@ impl AdnlNode {
             _ => fail!("Unsupported ADNL message {:?}", msg)
         };
         if let Some(msg) = msg {
-            self.send_message(other_key, local_key, msg)?;
+            self.send_message(msg, peers)?;
         }
         Ok(())
     }
 
     async fn receive(
         &self, 
-        receiver: &mut tokio::net::udp::RecvHalf,
+        buf: &mut Vec<u8>,
         subscribers: &Vec<Arc<dyn Subscriber>>,
     ) -> Result<()> {
-        const SIZE_BUFFER: usize = 2048;
-        let mut buf = Vec::with_capacity(SIZE_BUFFER);
-        buf.resize(SIZE_BUFFER, 0);
-        let (len, _) = receiver.recv_from(&mut buf[..]).await?;
-        buf.truncate(len);
         let (local_key, other_key) = if let Some(local_key) = AdnlHandshake::parse_packet(
             &self.config.keys, 
-            &mut buf, 
+            buf, 
             None
         )? {
             (local_key, None)
         } else if let Some(channel) = self.channels_recv.get(&buf[0..32]) {
             let channel = channel.val();
-            channel.decrypt(&mut buf)?;
+            channel.decrypt(buf)?;
             if let Some(removed) = self.channels_wait.remove(&channel.other_key) {
                 let result = self.channels_send.reinsert(removed);
                 if let lockfree::map::Insertion::Failed(_) = result {
@@ -1149,11 +1376,12 @@ impl AdnlNode {
             .downcast::<AdnlPacketContents>()
             .map_err(|pkt| failure::format_err!("Unsupported ADNL packet format {:?}", pkt))?;
         let other_key = self.check_packet(&pkt, &local_key, other_key)?;        
+        let peers = AdnlPeers::with_keys(local_key, other_key);
         if let Some(msg) = pkt.message() { 
-            self.process(subscribers, msg, &local_key, &other_key).await?
+            self.process(subscribers, msg, &peers).await?
         } else if let Some(msgs) = pkt.messages() {
             for msg in msgs.deref() {
-                self.process(subscribers, msg, &local_key, &other_key).await?;
+                self.process(subscribers, msg, &peers).await?;
             }
         } else {
             // Specifics of implementation. 
@@ -1172,15 +1400,16 @@ impl AdnlNode {
         Ok(())
     }
 
-    fn send_message(&self, dst: &Arc<KeyId>, src: &Arc<KeyId>, msg: AdnlMessage) -> Result<()> {
-        let peer = self.peers(src)?;
-        let peer = if let Some(peer) = peer.get(dst) {
+    fn send_message(&self, msg: AdnlMessage, peers: &AdnlPeers) -> Result<()> {
+        let peer = self.peers(peers.local())?;
+        let peer = if let Some(peer) = peer.get(peers.other()) {
             peer
         } else {
-            fail!("Unknown peer {}", dst)
+            fail!("Unknown peer {}", peers.other())
         };
         let peer = peer.val();
-        let src = self.key_by_id(src)?;
+        let src = self.key_by_id(peers.local())?;
+        let dst = peers.other();
         let channel = self.channels_send.get(dst);
         let (msg, msgs) = if channel.is_none() && self.channels_wait.get(dst).is_none() {
             let mut msgs = Vec::new();
@@ -1223,8 +1452,8 @@ impl AdnlNode {
                     self.build_address_list(peer.recv_state.reinit_date())?
                 ),
                 priority_address: None,
-                seqno: Some(peer.send_state.next_seqno()),
-                confirm_seqno: Some(peer.recv_state.seqno()),
+                seqno: Some(peer.send_state.load_seqno() as i64),
+                confirm_seqno: Some(peer.recv_state.seqno() as i64),
                 recv_addr_list_version: None,
                 recv_priority_addr_list_version: None,
                 reinit_date: if channel.is_some() {
