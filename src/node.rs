@@ -1,9 +1,10 @@
 use crate::{
     from_slice, 
     common::{
-        add_object_to_map, AdnlCryptoUtils, AdnlHandshake, AdnlPeers, AdnlPingSubscriber, 
-        deserialize, get256, hash, KeyId, KeyOption, KeyOptionJson, Query, QueryCache, 
-        QueryId, serialize, Subscriber, TARGET, UpdatedAt, Version
+        add_object_to_map, add_object_to_map_with_update, AdnlCryptoUtils, AdnlHandshake, 
+        AdnlPeers, AdnlPingSubscriber, deserialize, get256, hash, KeyId, KeyOption, 
+        KeyOptionJson, Query, QueryCache, QueryId, serialize, Subscriber, TARGET, UpdatedAt, 
+        Version
     }
 };
 use aes_ctr::stream_cipher::SyncStreamCipher;
@@ -21,7 +22,10 @@ use ton_api::{
         adnl::{
             Address, Message as AdnlMessage, PacketContents as AdnlPacketContents, 
             address::address::Udp, addresslist::AddressList, id::short::Short as AdnlIdShort,  
-            message::message::{ConfirmChannel, CreateChannel, Custom as AdnlCustomMessage}, 
+            message::message::{
+                ConfirmChannel, CreateChannel, Custom as AdnlCustomMessage, 
+                Part as AdnlPartMessage
+            }, 
             packetcontents::PacketContents
         },
         pub_::publickey::Aes as AesKey
@@ -343,8 +347,9 @@ struct AdnlNodeAddress {
 
 impl AdnlNodeAddress {
     fn from_ip_address_and_key(ip_address: IpAddress, key: Arc<KeyOption>) -> Result<Self> {
+        let (_, channel_key) = KeyOption::with_type_id(key.type_id())?;
         let ret = Self {
-            channel_key: Arc::new(KeyOption::with_type_id(key.type_id())?),
+            channel_key: Arc::new(channel_key),
             ip_address: AtomicU64::new(ip_address.0),
             key
         };
@@ -423,27 +428,19 @@ impl AdnlNodeConfig {
 
     /// Construct from JSON config structure
     pub fn from_json_config(json_config: &AdnlNodeConfigJson, as_src: bool) -> Result<Self> {
-        let tags = lockfree::map::Map::new();
-        let keys = lockfree::map::Map::new();
+        let ret = AdnlNodeConfig {
+            ip_address: json_config.ip_address()?,
+            tags: lockfree::map::Map::new(),
+            keys: lockfree::map::Map::new()
+        };
         for key in json_config.keys.iter() {
             let data = if as_src {
                 KeyOption::from_private_key(&key.data)?
             } else {
                 KeyOption::from_public_key(&key.data)?
             };
-            let id = data.id().clone();
-            if tags.insert(key.tag, id.clone()).is_some() {
-                fail!("Duplicated key tag {} in node config", key.tag)
-            }
-            if keys.insert(id.clone(), Arc::new(data)).is_some() {
-                fail!("Duplicated key {} in node config", id)
-            }
+            ret.add_key(data, key.tag)?;
         }
-        let ret = AdnlNodeConfig {
-            ip_address: json_config.ip_address()?,
-            tags,
-            keys
-        };
         Ok(ret)
     }
 
@@ -452,8 +449,10 @@ impl AdnlNodeConfig {
         ip_address: &str, 
         type_id: i32, 
         tag: usize
-    ) -> Result<Self> {
-        Self::from_ip_address_and_key(ip_address, KeyOption::with_type_id(type_id)?, tag)
+    ) -> Result<([u8; 32], Self)> {
+        let (export, key) = KeyOption::with_type_id(type_id)?;
+        let ret = Self::from_ip_address_and_key(ip_address, key, tag)?;
+        Ok((export, ret))
     }    
 
     /// Node IP address
@@ -482,6 +481,47 @@ impl AdnlNodeConfig {
     /// Set port number
     pub fn set_port(&mut self, port: u16) {
         self.ip_address.set_port(port)
+    }
+
+    fn add_key(&self, key: KeyOption, tag: usize) -> Result<Arc<KeyId>> {
+        let mut ret = key.id().clone();
+        let added = add_object_to_map_with_update(
+            &self.tags, 
+            tag, 
+            |found| if let Some(found) = found {
+                if found != &ret {
+                    fail!("Duplicated key tag {} in node", tag)
+                } else {
+                    ret = found.clone();
+                    Ok(None)
+                }
+            } else {
+                Ok(Some(ret.clone()))
+            }
+        )?;
+        if added {
+            let key = Arc::new(key);
+            add_object_to_map_with_update(
+                &self.keys, 
+                ret.clone(), 
+                |found| if found.is_some() {
+                    fail!("Duplicated key {} in node", ret)
+                } else {
+                    Ok(Some(key.clone()))
+                }
+            )?;
+        }
+        Ok(ret)
+    }
+
+    fn delete_key(&self, key: &Arc<KeyId>, tag: usize) -> Result<bool> {
+        let removed_key = self.keys.remove(key);
+        if let Some(removed) = self.tags.remove(&tag) {
+            if removed.val() != key {
+                fail!("Expected {} key with tag {} but got {}", key, tag, removed.val())
+            }
+        }
+        Ok(removed_key.is_some())
     }
 
 }
@@ -695,7 +735,7 @@ struct SendJob {
 
 struct Transfer {
     data: lockfree::map::Map<usize, Vec<u8>>,
-    received: 	AtomicUsize,
+    received: AtomicUsize,
     total: usize,
     updated: UpdatedAt
 }
@@ -717,12 +757,13 @@ pub struct AdnlNode {
     queue_sender: tokio::sync::mpsc::UnboundedSender<SendJob>,
     queue_reader: lockfree::queue::Queue<tokio::sync::mpsc::UnboundedReceiver<SendJob>>,
     start_time: i32,
-    transfers: lockfree::map::Map<TransferId, Transfer>
+    transfers: Arc<lockfree::map::Map<TransferId, Arc<Transfer>>>
 }
 
 impl AdnlNode {
 
     const CLOCK_TOLERANCE: i32 = 60;     // Seconds
+    const MAX_ADNL_MESSAGE: usize = 1024;
     const MAX_QUERY_DROPS: u32 = 10;    
     const SIZE_BUFFER: usize = 2048;
     const TIMEOUT_ADDRESS: i32 = 1000;   // Seconds
@@ -764,7 +805,7 @@ impl AdnlNode {
             queue_sender,
             queue_reader: lockfree::queue::Queue::new(),
             start_time: Version::get(),
-            transfers: lockfree::map::Map::new()
+            transfers: Arc::new(lockfree::map::Map::new())
         };
         ret.queue_reader.push(queue_reader);
         Ok(Arc::new(ret))
@@ -839,6 +880,11 @@ impl AdnlNode {
         );
         Ok(())
     }       
+
+    /// Add key
+    pub fn add_key(&self, key: KeyOption, tag: usize) -> Result<Arc<KeyId>> {
+        self.config.add_key(key, tag)
+    }
     
     /// Add peer 
     pub fn add_peer(
@@ -898,16 +944,12 @@ impl AdnlNode {
     }
 
     /// Build address list for given node
-    pub fn build_address_list(&self, reinit_date: i32) -> Result<AddressList> {
+    pub fn build_address_list(&self) -> Result<AddressList> {
         let version = Version::get();
         let ret = AddressList {
             addrs: vec![self.config.ip_address.into_udp().into_boxed()].into(),
             version,
-            reinit_date: if reinit_date == 0 {
-                version
-            } else {
-                reinit_date
-            },
+            reinit_date: self.start_time,
             priority: 0,
             expire_at: version + Self::TIMEOUT_ADDRESS
         };
@@ -922,6 +964,20 @@ impl AdnlNode {
         } else {
             timeout
         }
+    }
+
+    /// Delete key
+    pub fn delete_key(&self, key: &Arc<KeyId>, tag: usize) -> Result<bool> {
+        self.peers.remove(key);
+        self.config.delete_key(key, tag)
+    }
+
+    /// Delete peer
+    pub fn delete_peer(&self, local_key: &Arc<KeyId>, peer_key: &Arc<KeyId>) -> Result<bool> {
+        let peers = self.peers.get(local_key).ok_or_else(
+            || error!("Try to remove peer {} from unknown local key {}", peer_key, local_key)
+        )?;
+        Ok(peers.val().remove(peer_key).is_some())
     }
 
     /// Node IP address
@@ -1233,9 +1289,10 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
         peers: &AdnlPeers
     ) -> Result<()> {
         let new_msg = if let AdnlMessage::Adnl_Message_Part(part) = msg {
-            add_object_to_map(
+            let transfer_id = get256(&part.hash);
+            let added = add_object_to_map(
                 &self.transfers,
-                part.hash.0,
+                transfer_id.clone(),
                 || {
                     let transfer = Transfer {
                         data: lockfree::map::Map::new(),
@@ -1243,21 +1300,45 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
                         total: part.total_size as usize,
                         updated: UpdatedAt::new()
                     };
-                    Ok(transfer)
+                    Ok(Arc::new(transfer))
                 }
             )?;
-            if let Some(transfer) = self.transfers.get(&part.hash.0) {
+            if let Some(transfer) = self.transfers.get(transfer_id) {
+                if added {
+                    let transfers_wait = self.transfers.clone();
+                    let transfer_wait = transfer.val().clone();
+                    let transfer_id_wait = transfer_id.clone();
+                    tokio::spawn(
+                        async move {
+                            loop {
+                                tokio::time::delay_for(
+                                    Duration::from_millis(Self::TIMEOUT_TRANSFER * 100)
+                                ).await;
+                                if transfer_wait.updated.is_expired(Self::TIMEOUT_TRANSFER) {
+                                    if transfers_wait.remove(&transfer_id_wait).is_some() {
+                                        log::debug!(
+                                            target: TARGET, 
+                                            "ADNL transfer {} timed out",
+                                            base64::encode(&transfer_id_wait)
+                                        );
+                                    }
+                                    break
+                                }
+                            }
+                        }
+                    );
+                }
                 let transfer = transfer.val();
                 transfer.updated.refresh();
                 transfer.data.insert(part.offset as usize, part.data.to_vec());
                 transfer.received.fetch_add(part.data.len(), atomic::Ordering::Relaxed);
-                match Self::update_transfer(transfer) {
+                match Self::update_transfer(transfer_id, transfer) {
                     Ok(Some(msg)) => {
-                        self.transfers.remove(&part.hash.0);
+                        self.transfers.remove(transfer_id);
                         Some(msg)
                     },
                     Err(error) => {
-                        self.transfers.remove(&part.hash.0);
+                        self.transfers.remove(transfer_id);
                         return Err(error)
                     },
                     _ => return Ok(())
@@ -1268,22 +1349,7 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
         } else {
             None
         };
-        let msg = if let Some(msg) = &new_msg {
-            msg
-        } else {
-            msg
-        };
-        for transfer in self.transfers.iter() {
-            if transfer.val().updated.is_expired(Self::TIMEOUT_TRANSFER) {
-                self.transfers.remove(transfer.key());
-                log::debug!(
-                    target: TARGET, 
-                    "ADNL transfer {} timed out",
-                    base64::encode(transfer.key())
-                );
-            }
-        }
-        let msg = match msg {
+        let msg = match new_msg.as_ref().unwrap_or(msg) {
             AdnlMessage::Adnl_Message_Answer(answer) => {
                 let query_id = answer.query_id.0;
                 if !Self::update_query(&self.queries, query_id, Some(&answer.answer)).await? {
@@ -1411,46 +1477,96 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
         let src = self.key_by_id(peers.local())?;
         let dst = peers.other();
         let channel = self.channels_send.get(dst);
-        let (msg, msgs) = if channel.is_none() && self.channels_wait.get(dst).is_none() {
-            let mut msgs = Vec::new();
-            msgs.push(
+        let create_channel_msg = if channel.is_none() && self.channels_wait.get(dst).is_none() {
+            log::debug!(target: TARGET, "Create channel {} -> {}", src.id(), dst);
+            Some(
                 CreateChannel {
                     key: ton::int256(peer.address.channel_key.pub_key()?.clone()),
                     date: Version::get()
                 }.into_boxed()
-            );
-            log::debug!(target: TARGET, "Create channel {} -> {}", src.id(), dst);
-            msgs.push(msg);
-            (None, Some(msgs))
+            )
         } else {
-            (Some(msg), None)
+            None
         };
+        let mut size = if create_channel_msg.is_some() {
+            40
+        } else {
+            0
+        };
+        size += match &msg {
+            AdnlMessage::Adnl_Message_Answer(answer) => answer.answer.len() + 44,
+            AdnlMessage::Adnl_Message_ConfirmChannel(_) => 72,
+            AdnlMessage::Adnl_Message_Custom(custom) => custom.data.len() + 12,
+            AdnlMessage::Adnl_Message_Query(query) => query.query.len() + 44,
+            _ => fail!("Unexpected message to send {:?}", msg)  
+        };
+        let channel = if let Some(ref channel) = channel {
+            Some(channel.val())
+        } else {
+            None
+        };
+        if size <= Self::MAX_ADNL_MESSAGE {
+            if let Some(create_channel_msg) = create_channel_msg {
+                self.send_packet(peer, &src, channel, None, Some(vec![create_channel_msg, msg]))
+            } else {
+                self.send_packet(peer, &src, channel, Some(msg), None)
+            }
+        } else {
+            if let Some(create_channel_msg) = create_channel_msg {
+                self.send_packet(peer, &src, channel, Some(create_channel_msg), None)?
+            }
+            let data = serialize(&msg)?;
+            let hash = sha2::Sha256::digest(&data);
+            let mut offset = 0;
+            while offset < data.len() {
+                let next = min(data.len(), offset + Self::MAX_ADNL_MESSAGE);
+                let mut part = Vec::new();
+                part.extend_from_slice(&data[offset..next]);
+                let part = AdnlPartMessage {
+                    hash: ton::int256(arrayref::array_ref!(hash.as_slice(), 0, 32).clone()),
+                    total_size: data.len() as i32,
+                    offset: offset as i32,
+                    data: ton::bytes(part)
+                }.into_boxed();
+                self.send_packet(peer, &src, channel, Some(part), None)?;
+                offset = next;
+            };
+            Ok(())
+        }
+    }
+
+    fn send_packet(
+        &self, 
+        peer: &Peer,
+        source: &KeyOption,
+        channel: Option<&Arc<AdnlChannel>>, 
+        message: Option<AdnlMessage>, 
+        messages: Option<Vec<AdnlMessage>>
+    ) -> Result<()> {
         let mut data = serialize(
             &PacketContents {
                 rand1: ton::bytes(Self::gen_rand()),
                 from: if channel.is_some() {
                     None
                 } else {
-                    Some(src.into_tl_public_key()?)
+                    Some(source.into_tl_public_key()?)
                 },
                 from_short: if channel.is_some() {
                     None
                 } else {
                     Some(
                         AdnlIdShort {
-                            id: ton::int256(src.id().data().clone())
+                            id: ton::int256(source.id().data().clone())
                         }
                     )
                 }, 
-                message: msg,
-                messages: if let Some(msgs) = msgs {
-                    Some(msgs.into())
+                message,
+                messages: if let Some(messages) = messages {
+                    Some(messages.into())
                 } else {
                     None
                 },
-                address: Some(
-                    self.build_address_list(peer.recv_state.reinit_date())?
-                ),
+                address: Some(self.build_address_list()?),
                 priority_address: None,
                 seqno: Some(peer.send_state.load_seqno() as i64),
                 confirm_seqno: Some(peer.recv_state.seqno() as i64),
@@ -1471,9 +1587,9 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
             }.into_boxed()
         )?;
         if let Some(channel) = channel {
-            channel.val().encrypt(&mut data)?
+            channel.encrypt(&mut data)?
         } else {
-            let key = KeyOption::with_type_id(src.type_id())?;
+            let (_, key) = KeyOption::with_type_id(source.type_id())?;
             AdnlHandshake::build_packet(&mut data, &key, &peer.address.key)?;
         }
         let job = SendJob { 
@@ -1524,7 +1640,10 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
         Ok(true)
     }
 
-    fn update_transfer(transfer: &Transfer) -> Result<Option<AdnlMessage>> {
+    fn update_transfer(
+        transfer_id: &TransferId, 
+        transfer: &Transfer
+    ) -> Result<Option<AdnlMessage>> {
         let mut received = transfer.received.load(atomic::Ordering::Relaxed);
         if received > transfer.total {
             fail!("Invalid ADNL part transfer: size mismatch")
@@ -1541,9 +1660,13 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
                     fail!("Invalid ADNL part transfer: parts mismatch")
                 }
             }
-            let msg = deserialize(&buf[..])?
+            let hash = sha2::Sha256::digest(&buf);
+            if arrayref::array_ref!(hash.as_slice(), 0, 32) != transfer_id {
+                fail!("Bad hash of ADNL transfer {}", base64::encode(transfer_id))
+            }
+            let msg = deserialize(&buf)?
                 .downcast::<AdnlMessage>()
-                .map_err(|msg| failure::format_err!("Unsupported ADNL messge {:?}", msg))?;
+                .map_err(|msg| error!("Unsupported ADNL messge {:?}", msg))?;
             Ok(Some(msg))
         } else {
             Ok(None)

@@ -414,12 +414,13 @@ impl KeyOption {
     pub const KEY_ED25519: i32 = 1209251014;
 
     /// Generate 
-    pub fn with_type_id(type_id: i32) -> Result<Self> {
+    pub fn with_type_id(type_id: i32) -> Result<([u8; 32], Self)> {
         if type_id != Self::KEY_ED25519 {
             fail!("Generate is available for Ed25519 key only")
         }
         let sec_key = ed25519_dalek::SecretKey::generate(&mut rand::thread_rng());
-        Ok(Self::from_ed25519_secret_key(sec_key))
+        let export = sec_key.to_bytes();
+        Ok((export, Self::from_ed25519_secret_key(sec_key)))
     }
 
     /// Create from private key 
