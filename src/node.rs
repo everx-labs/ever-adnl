@@ -23,8 +23,8 @@ use ton_api::{
             Address, Message as AdnlMessage, PacketContents as AdnlPacketContents, 
             address::address::Udp, addresslist::AddressList, id::short::Short as AdnlIdShort,  
             message::message::{
-                ConfirmChannel, CreateChannel, Custom as AdnlCustomMessage, 
-                Part as AdnlPartMessage
+                Answer as AdnlAnswerMessage, ConfirmChannel, CreateChannel, 
+                Custom as AdnlCustomMessage, Part as AdnlPartMessage, Query as AdnlQueryMessage
             }, 
             packetcontents::PacketContents
         },
@@ -187,16 +187,37 @@ impl AddressCache {
         Ok(ret)
     }
 
-    pub fn random(&self) -> Option<Arc<KeyId>> {
+    pub fn random(&self, skip: Option<&lockfree::set::Set<Arc<KeyId>>>) -> Option<Arc<KeyId>> {
         let max = self.count();
-        if let Some(ret) = self.index.get(&rand::thread_rng().gen_range(0, max)) {
-            Some(ret.val().clone())
-        } else {
-            None
-        }
+        for _ in 0..10 {
+            if let Some(ret) = self.index.get(&rand::thread_rng().gen_range(0, max)) {
+                if let Some(skip) = skip {
+                    if skip.contains(ret.val()) {
+                        continue
+                    }
+                }
+                return Some(ret.val().clone())
+            }
+        } 
+        None
     }
 
-    pub fn random_set(&self, dst: &AddressCache, mut n: u32) -> Result<()> {
+    pub fn random_set(
+        &self, 
+        dst: &AddressCache, 
+        skip: Option<&lockfree::set::Set<Arc<KeyId>>>,
+        mut n: u32
+    ) -> Result<()> {
+        n = min(self.count(), n);
+        while n > 0 {
+            if let Some(key_id) = self.random(skip) {
+                dst.put(key_id)?;
+                n -= 1;
+            } else {
+                break;
+            }
+        }
+/*
         if dst.count() >= self.count() {
             return Ok(())
         }
@@ -210,6 +231,7 @@ impl AddressCache {
                 break;
             }
         }
+*/
         Ok(())
     }
   
@@ -756,6 +778,10 @@ pub struct AdnlNode {
     queries: Arc<QueryCache>, 
     queue_sender: tokio::sync::mpsc::UnboundedSender<SendJob>,
     queue_reader: lockfree::queue::Queue<tokio::sync::mpsc::UnboundedReceiver<SendJob>>,
+    queue_local_sender: tokio::sync::mpsc::UnboundedSender<(AdnlMessage, Arc<KeyId>)>,
+    queue_local_reader: lockfree::queue::Queue<
+        tokio::sync::mpsc::UnboundedReceiver<(AdnlMessage, Arc<KeyId>)>
+    >,
     start_time: i32,
     transfers: Arc<lockfree::map::Map<TransferId, Arc<Transfer>>>
 }
@@ -794,6 +820,7 @@ impl AdnlNode {
             }
         }
         let (queue_sender, queue_reader) = tokio::sync::mpsc::unbounded_channel();
+        let (queue_local_sender, queue_local_reader) = tokio::sync::mpsc::unbounded_channel();
         let incinerator = lockfree::map::SharedIncin::new();
         let ret = Self {
             config, 
@@ -804,10 +831,13 @@ impl AdnlNode {
             queries: Arc::new(lockfree::map::Map::new()), 
             queue_sender,
             queue_reader: lockfree::queue::Queue::new(),
+            queue_local_sender,
+            queue_local_reader: lockfree::queue::Queue::new(),
             start_time: Version::get(),
             transfers: Arc::new(lockfree::map::Map::new())
         };
         ret.queue_reader.push(queue_reader);
+        ret.queue_local_reader.push(queue_local_reader);
         Ok(Arc::new(ret))
     }
 
@@ -816,11 +846,12 @@ impl AdnlNode {
         node: &Arc<Self>, 
         mut subscribers: Vec<Arc<dyn Subscriber>>
     ) -> Result<()> {
-        let mut queue_reader = if let Some(queue_reader) = node.queue_reader.pop() {
-            queue_reader
-        } else {
-            fail!("ADNL node already started")
-        };
+        let mut queue_reader = node.queue_reader.pop().ok_or_else(
+            || error!("ADNL node already started")
+        )?;
+        let mut queue_local_reader = node.queue_local_reader.pop().ok_or_else(
+            || error!("ADNL node already started")
+        )?;
         let (mut receiver, mut sender) = 
             tokio::net::UdpSocket::bind(
                 &SocketAddr::new(
@@ -831,11 +862,14 @@ impl AdnlNode {
             .await?
             .split();
         let node = node.clone();
+        let node_local = node.clone();
         subscribers.push(Arc::new(AdnlPingSubscriber));
+        let subscribers = Arc::new(subscribers);
+        let subscribers_local = subscribers.clone();
+        // Remote connections
         tokio::spawn(
             async move {
                 let mut buf_source = None;
-                let subscribers = Arc::new(subscribers);
                 loop {            
                     let buf = buf_source.get_or_insert_with(
                         || {
@@ -875,6 +909,41 @@ impl AdnlNode {
                     if let Err(e) = Self::send(&mut sender, job).await {
                         log::warn!(target: TARGET, "ERROR --> {}", e);
                     }
+                }
+            }
+        );
+        // Local connections
+        tokio::spawn(
+            async move {
+                while let Some((msg, src)) = queue_local_reader.recv().await {
+                    let query = match msg {
+                        AdnlMessage::Adnl_Message_Query(query) => query,
+                        x => {
+                            log::warn!(target: TARGET, "Unsupported local ADNL message {:?}", x);
+                            continue;
+                        }
+                    };
+                    let node_local = node_local.clone();
+                    let subscribers_local = subscribers_local.clone();
+                    tokio::spawn(
+                        async move {
+                            let answer = match Self::process_query(&subscribers_local, &query).await {
+                                Ok(Some(AdnlMessage::Adnl_Message_Answer(answer))) => answer,
+                                Ok(Some(x)) => {
+                                    log::warn!(target: TARGET, "Unexpected reply {:?}", x);
+                                    return
+                                },
+                                Err(e) => {
+                                    log::warn!(target: TARGET, "ERROR --> {}", e);
+                                    return
+                                },
+                                _ => return
+                            };
+                            if let Err(e) = node_local.process_answer(&answer, &src).await {
+                                log::warn!(target: TARGET, "ERROR --> {}", e);
+                            }
+                        }            
+                    );
                 }
             }
         );
@@ -1039,8 +1108,14 @@ impl AdnlNode {
         let (ping, query) = Query::new();
         self.queries.insert(query_id, query);
 log::warn!("Sent query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], query_id[2], query_id[3]);
-        let channel = self.channels_send.get(peers.other());
-        self.send_message(msg, peers)?;
+        let channel = if peers.local() == peers.other() {       
+            self.queue_local_sender.send((msg, peers.local().clone()))?;
+            None
+        } else {
+            let channel = self.channels_send.get(peers.other());
+            self.send_message(msg, peers)?;
+            channel
+        };
         let queries = self.queries.clone();
         tokio::spawn(
             async move {
@@ -1351,10 +1426,7 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
         };
         let msg = match new_msg.as_ref().unwrap_or(msg) {
             AdnlMessage::Adnl_Message_Answer(answer) => {
-                let query_id = answer.query_id.0;
-                if !Self::update_query(&self.queries, query_id, Some(&answer.answer)).await? {
-                    fail!("Received answer from {} to unknown query {:?}", peers.other(), answer)
-                }
+                self.process_answer(answer, peers.other()).await?;
                 None
             },
             AdnlMessage::Adnl_Message_ConfirmChannel(confirm) => {
@@ -1400,11 +1472,7 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
                 None
             },
             AdnlMessage::Adnl_Message_Query(query) => {
-                if let (true, answer) = Query::process_adnl(subscribers, query).await? {
-                    answer
-                } else {
-                    fail!("No subscribers for query {:?}", query)
-                }
+                Self::process_query(subscribers, query).await?
             },
             _ => fail!("Unsupported ADNL message {:?}", msg)
         };
@@ -1412,6 +1480,25 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
             self.send_message(msg, peers)?;
         }
         Ok(())
+    }
+
+    async fn process_answer(&self, answer: &AdnlAnswerMessage, src: &Arc<KeyId>) -> Result<()> {
+        let query_id = get256(&answer.query_id).clone();
+        if !Self::update_query(&self.queries, query_id, Some(&answer.answer)).await? {
+            fail!("Received answer from {} to unknown query {:?}", src, answer)
+        }
+        Ok(())
+    }
+
+    async fn process_query(
+        subscribers: &Vec<Arc<dyn Subscriber>>,
+        query: &AdnlQueryMessage
+    ) -> Result<Option<AdnlMessage>> {
+        if let (true, answer) = Query::process_adnl(subscribers, query).await? {
+            Ok(answer)
+        } else {
+            fail!("No subscribers for query {:?}", query)
+        }
     }
 
     async fn receive(
