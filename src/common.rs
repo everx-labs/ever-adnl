@@ -487,7 +487,11 @@ impl KeyOption {
 
     /// Create from Ed25519 secret key
     pub fn from_ed25519_secret_key(key: ed25519_dalek::SecretKey) -> Self {
-        let exp_key = ed25519_dalek::ExpandedSecretKey::from(&key);
+        Self::from_ed25519_expanded_secret_key(ed25519_dalek::ExpandedSecretKey::from(&key))
+    }
+
+    /// Create from Ed25519 expanded secret key
+    pub fn from_ed25519_expanded_secret_key(exp_key: ed25519_dalek::ExpandedSecretKey) -> Self {
         let pub_key = ed25519_dalek::PublicKey::from(&exp_key).to_bytes();
         let exp_key = &exp_key.to_bytes();
         let pvt_key = &exp_key[..32];
