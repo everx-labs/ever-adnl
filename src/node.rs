@@ -1013,14 +1013,14 @@ impl AdnlNode {
     }
 
     /// Build address list for given node
-    pub fn build_address_list(&self) -> Result<AddressList> {
+    pub fn build_address_list(&self, expire_at: Option<i32>) -> Result<AddressList> {
         let version = Version::get();
         let ret = AddressList {
             addrs: vec![self.config.ip_address.into_udp().into_boxed()].into(),
             version,
             reinit_date: self.start_time,
             priority: 0,
-            expire_at: version + Self::TIMEOUT_ADDRESS
+            expire_at: expire_at.unwrap_or(0)
         };
         Ok(ret)
     }
@@ -1653,7 +1653,9 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
                 } else {
                     None
                 },
-                address: Some(self.build_address_list()?),
+                address: Some(
+                    self.build_address_list(Some(Version::get() + Self::TIMEOUT_ADDRESS))?
+                ),
                 priority_address: None,
                 seqno: Some(peer.send_state.load_seqno() as i64),
                 confirm_seqno: Some(peer.recv_state.seqno() as i64),
