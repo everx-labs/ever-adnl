@@ -8,12 +8,13 @@ use crate::{
     }
 };
 use aes_ctr::stream_cipher::SyncStreamCipher;
-use core::sync::atomic::{self, AtomicI32, AtomicU32, AtomicU64, AtomicUsize};
 use rand::Rng;
 use sha2::Digest;
 use std::{
     cmp::{min, Ordering}, fmt::{self, Debug, Display, Formatter}, 
-    net::{IpAddr, Ipv4Addr, SocketAddr}, ops::Deref, sync::Arc, time::Duration
+    net::{IpAddr, Ipv4Addr, SocketAddr}, ops::Deref, 
+    sync::{Arc, atomic::{self, AtomicI32, AtomicU32, AtomicU64, AtomicUsize}},
+    time::Duration
 };
 use ton_api::{
     IntoBoxed, 
@@ -152,7 +153,16 @@ impl AddressCache {
 
     pub fn next(&self, iter: &mut AddressCacheIterator) -> Option<Arc<KeyId>> {
         let AddressCacheIterator(ref mut index) = iter;
-        self.find_by_index({*index += 1; *index})
+        loop {
+            let ret = self.find_by_index({*index += 1; *index});
+            if ret.is_some() {
+                return ret
+            }
+            let limit = self.upper.load(atomic::Ordering::Relaxed);
+            if *index >= min(limit, self.limit) {
+                return None
+            }
+        }
     }
 
     pub fn put(&self, address: Arc<KeyId>) -> Result<bool> {
@@ -424,21 +434,18 @@ impl AdnlNodeConfigJson {
 impl AdnlNodeConfig {
 
     /// Construct from IP address and key data
-    pub fn from_ip_address_and_key(
+    pub fn from_ip_address_and_keys(
         ip_address: &str, 
-        key: KeyOption,
-        tag: usize
+        keys: Vec<(KeyOption, usize)>
     ) -> Result<Self> {
-        let tags = lockfree::map::Map::new();
-        let keys = lockfree::map::Map::new();
-        let data = Arc::new(key);
-        tags.insert(tag, data.id().clone());
-        keys.insert(data.id().clone(), data);
         let ret = AdnlNodeConfig {
             ip_address: IpAddress::from_string(ip_address)?,
-            tags,
-            keys
+            tags: lockfree::map::Map::new(),
+            keys: lockfree::map::Map::new()
         };
+        for (key, tag) in keys {
+            ret.add_key(key, tag)?;
+        } 
         Ok(ret)
     }    
 
@@ -470,11 +477,17 @@ impl AdnlNodeConfig {
     pub fn with_ip_address_and_key_type(
         ip_address: &str, 
         type_id: i32, 
-        tag: usize
-    ) -> Result<([u8; 32], Self)> {
-        let (export, key) = KeyOption::with_type_id(type_id)?;
-        let ret = Self::from_ip_address_and_key(ip_address, key, tag)?;
-        Ok((export, ret))
+        tags: Vec<usize>
+    ) -> Result<(Vec<[u8; 32]>, Self)> {
+        let mut exports = Vec::new();
+        let mut keys = Vec::new();
+        for tag in tags {
+            let (export, key) = KeyOption::with_type_id(type_id)?;
+            exports.push(export);
+            keys.push((key, tag));
+        }
+        let ret = Self::from_ip_address_and_keys(ip_address, keys)?;
+        Ok((exports, ret))
     }    
 
     /// Node IP address
@@ -783,6 +796,7 @@ pub struct AdnlNode {
         tokio::sync::mpsc::UnboundedReceiver<(AdnlMessage, Arc<KeyId>)>
     >,
     start_time: i32,
+    stop: AtomicU32,
     transfers: Arc<lockfree::map::Map<TransferId, Arc<Transfer>>>
 }
 
@@ -795,6 +809,8 @@ impl AdnlNode {
     const TIMEOUT_ADDRESS: i32 = 1000;   // Seconds
     const TIMEOUT_QUERY_MIN: u64 = 500;  // Milliseconds
     const TIMEOUT_QUERY_MAX: u64 = 5000; // Milliseconds
+    const TIMEOUT_QUERY_STOP: u64 = 1;   // Milliseconds
+    const TIMEOUT_SHUTDOWN: u64 = 2000;  // Milliseconds
     const TIMEOUT_TRANSFER: u64 = 3;     // Seconds
 
     /// Constructor
@@ -834,6 +850,7 @@ impl AdnlNode {
             queue_local_sender,
             queue_local_reader: lockfree::queue::Queue::new(),
             start_time: Version::get(),
+            stop: AtomicU32::new(0),
             transfers: Arc::new(lockfree::map::Map::new())
         };
         ret.queue_reader.push(queue_reader);
@@ -861,12 +878,37 @@ impl AdnlNode {
             )
             .await?
             .split();
-        let node = node.clone();
-        let node_local = node.clone();
+        let node_stop = node.clone();
+        // Stopping watchdog
+        tokio::spawn(
+            async move {
+                loop {
+                    tokio::time::delay_for(Duration::from_millis(Self::TIMEOUT_QUERY_STOP)).await;
+                    if node_stop.stop.load(atomic::Ordering::Relaxed) > 0 {
+                        let close = SendJob { 
+                            destination: 
+                                0x7F0000010000u64 | node_stop.config.ip_address.port() as u64, 
+                            data: Vec::new()
+                        };
+                        if let Err(e) = node_stop.queue_sender.send(close) {
+                            log::warn!(target: TARGET, "Cannot close node socket: {}", e);
+                        }
+                        let close = (AdnlMessage::Adnl_Message_Nop, KeyId::from_data([0u8; 32]));
+                        if let Err(e) = node_stop.queue_local_sender.send(close) {
+                            log::warn!(target: TARGET, "Cannot close node loopback: {}", e);
+                        }
+                        break
+                    }
+                }
+                node_stop.stop.fetch_add(1, atomic::Ordering::Relaxed);
+                log::warn!(target: TARGET, "Node stopping watchdog exited");
+            }
+        );
         subscribers.push(Arc::new(AdnlPingSubscriber));
         let subscribers = Arc::new(subscribers);
         let subscribers_local = subscribers.clone();
         // Remote connections
+        let node_recv = node.clone();
         tokio::spawn(
             async move {
                 let mut buf_source = None;
@@ -878,7 +920,11 @@ impl AdnlNode {
                             buf                                                       
                         }
                     );
-                    let len = match receiver.recv_from(&mut buf[..]).await {
+                    let res = receiver.recv_from(&mut buf[..]).await;
+                    if node_recv.stop.load(atomic::Ordering::Relaxed) > 0 {
+                        break
+                    }
+                    let len = match res {
                         Err(e) => {
                             log::warn!(target: TARGET, "ERROR <-- {}", e);
                             continue
@@ -891,31 +937,43 @@ impl AdnlNode {
                         continue
                     };
                     buf.truncate(len);
-                    let node = node.clone();
+                    let node_recv = node_recv.clone();
                     let subscribers = subscribers.clone();
                     tokio::spawn (
                         async move {
-                            if let Err(e) = node.receive(&mut buf, &subscribers).await {
+                            if let Err(e) = node_recv.receive(&mut buf, &subscribers).await {
                                 log::warn!(target: TARGET, "ERROR <-- {}", e)
                             }
                         }
                     );
                 }
+                node_recv.stop.fetch_add(1, atomic::Ordering::Relaxed);
+                log::warn!(target: TARGET, "Node socket receiver exited");
             }
         );
+        let node_send = node.clone();
         tokio::spawn(
             async move {
                 while let Some(job) = queue_reader.recv().await {
                     if let Err(e) = Self::send(&mut sender, job).await {
                         log::warn!(target: TARGET, "ERROR --> {}", e);
                     }
+                    if node_send.stop.load(atomic::Ordering::Relaxed) > 0 {
+                        break
+                    }
                 }
+                node_send.stop.fetch_add(1, atomic::Ordering::Relaxed);
+                log::warn!(target: TARGET, "Node socket sender exited");
             }
         );
         // Local connections
+        let node_loop = node.clone();
         tokio::spawn(
             async move {
                 while let Some((msg, src)) = queue_local_reader.recv().await {
+                    if node_loop.stop.load(atomic::Ordering::Relaxed) > 0 {
+                        break
+                    }
                     let query = match msg {
                         AdnlMessage::Adnl_Message_Query(query) => query,
                         x => {
@@ -923,11 +981,16 @@ impl AdnlNode {
                             continue;
                         }
                     };
-                    let node_local = node_local.clone();
+                    let node_loop = node_loop.clone();
+                    let peers_local = AdnlPeers::with_keys(src.clone(), src.clone());
                     let subscribers_local = subscribers_local.clone();
                     tokio::spawn(
                         async move {
-                            let answer = match Self::process_query(&subscribers_local, &query).await {
+                            let answer = match Self::process_query(
+                                &subscribers_local, 
+                                &query,
+                                &peers_local
+                            ).await {
                                 Ok(Some(AdnlMessage::Adnl_Message_Answer(answer))) => answer,
                                 Ok(Some(x)) => {
                                     log::warn!(target: TARGET, "Unexpected reply {:?}", x);
@@ -939,16 +1002,31 @@ impl AdnlNode {
                                 },
                                 _ => return
                             };
-                            if let Err(e) = node_local.process_answer(&answer, &src).await {
+                            if let Err(e) = node_loop.process_answer(&answer, &src).await {
                                 log::warn!(target: TARGET, "ERROR --> {}", e);
                             }
                         }            
                     );
                 }
+                node_loop.stop.fetch_add(1, atomic::Ordering::Relaxed);
+                log::warn!(target: TARGET, "Node loopback exited");
             }
         );
         Ok(())
     }       
+
+    pub async fn stop(&self) {
+        log::warn!(target: TARGET, "Stopping ADNL node");
+        self.stop.fetch_add(1, atomic::Ordering::Relaxed);
+        loop {
+            tokio::time::delay_for(Duration::from_millis(Self::TIMEOUT_QUERY_STOP)).await;
+            if self.stop.load(atomic::Ordering::Relaxed) >= 5 {
+                break
+            }
+        }
+        tokio::time::delay_for(Duration::from_millis(Self::TIMEOUT_SHUTDOWN)).await;
+        log::warn!(target: TARGET, "ADNL node stopped");
+    }
 
     /// Add key
     pub fn add_key(&self, key: KeyOption, tag: usize) -> Result<Arc<KeyId>> {
@@ -1472,7 +1550,7 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
                 None
             },
             AdnlMessage::Adnl_Message_Query(query) => {
-                Self::process_query(subscribers, query).await?
+                Self::process_query(subscribers, query, peers).await?
             },
             _ => fail!("Unsupported ADNL message {:?}", msg)
         };
@@ -1492,9 +1570,10 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
 
     async fn process_query(
         subscribers: &Vec<Arc<dyn Subscriber>>,
-        query: &AdnlQueryMessage
+        query: &AdnlQueryMessage,
+        peers: &AdnlPeers
     ) -> Result<Option<AdnlMessage>> {
-        if let (true, answer) = Query::process_adnl(subscribers, query).await? {
+        if let (true, answer) = Query::process_adnl(subscribers, query, peers).await? {
             Ok(answer)
         } else {
             fail!("No subscribers for query {:?}", query)

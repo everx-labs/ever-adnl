@@ -1,8 +1,8 @@
 use crate::{
-    dump, 
+    dump, from_slice,
     common::{
-        AdnlHandshake, AdnlPingSubscriber, AdnlStream, AdnlStreamCrypto, deserialize, KeyId, 
-        KeyOption, KeyOptionJson, Query, serialize_inplace, Subscriber, TARGET, Timeouts
+        AdnlHandshake, AdnlPeers, AdnlPingSubscriber, AdnlStream, AdnlStreamCrypto, deserialize, 
+        KeyId, KeyOption, KeyOptionJson, Query, serialize_inplace, Subscriber, TARGET, Timeouts
     }
 };
 use std::{
@@ -11,7 +11,7 @@ use std::{
 use stream_cancel::StreamExt;
 use futures::prelude::*;
 use ton_api::ton::adnl::Message as AdnlMessage;
-use ton_types::{fail, Result};
+use ton_types::{error, fail, Result};
 
 /// ADNL server configuration
 pub struct AdnlServerConfig {
@@ -124,7 +124,7 @@ impl AdnlServerThread {
                 fail!("Message from unknown client {}", base64::encode(&buf[32..64]))
             }
         }
-        let mut crypto = Self::parse_init_packet(&key, &mut buf)?;
+        let (mut crypto, peers) = Self::parse_init_packet(&key, &mut buf)?;
         buf.truncate(0);
         crypto.send(&mut stream, &mut buf).await?;
         loop {
@@ -134,7 +134,7 @@ impl AdnlServerThread {
                 .map_err(|msg| failure::format_err!("Unsupported ADNL message {:?}", msg))?;
             let (consumed, reply) = match &msg {
                 AdnlMessage::Adnl_Message_Query(query) => 
-                    Query::process_adnl(&subscribers, &query).await?,
+                    Query::process_adnl(&subscribers, &query, &peers).await?,
                 _ => (false, None)                
             };
             if consumed {
@@ -151,14 +151,22 @@ impl AdnlServerThread {
     fn parse_init_packet(
         key: &lockfree::map::Map<Arc<KeyId>, Arc<KeyOption>>,
         buf: &mut Vec<u8>
-    ) -> Result<AdnlStreamCrypto> {
-        AdnlHandshake::parse_packet(key, buf, Some(160))?;
+    ) -> Result<(AdnlStreamCrypto, AdnlPeers)> {
+        let other_key = &buf[32..64];
+        let other_key = from_slice!(other_key, 32);
+        let local_key = AdnlHandshake::parse_packet(key, buf, Some(160))?.ok_or_else(
+            || error!("Unknown ADNL server key, cannot decrypt")
+        )?;
+        let other_key = KeyOption::from_type_and_public_key(
+            KeyOption::KEY_ED25519, 
+            &other_key
+        ).id().clone();
         dump!(trace, TARGET, "Nonce", &buf[..160]);
         let ret = AdnlStreamCrypto::with_nonce_as_server(
             arrayref::array_mut_ref!(buf, 0, 160)
         );
         buf.drain(0..160);
-        return Ok(ret);
+        Ok((ret, AdnlPeers::with_keys(local_key, other_key)))
     }
 
 }

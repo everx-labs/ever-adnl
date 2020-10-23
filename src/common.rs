@@ -272,7 +272,11 @@ pub struct AdnlPingSubscriber;
 
 #[async_trait::async_trait]
 impl Subscriber for AdnlPingSubscriber {
-    async fn try_consume_query(&self, object: TLObject) -> Result<QueryResult> {
+    async fn try_consume_query(
+        &self, 
+        object: TLObject, 
+        _peers: &AdnlPeers
+    ) -> Result<QueryResult> {
         match object.downcast::<AdnlPing>() {
             Ok(ping) => QueryResult::consume(AdnlPong { value: ping.value }),
             Err(object) => Ok(QueryResult::Rejected(object))
@@ -649,9 +653,10 @@ impl Query {
     /// Process ADNL query
     pub async fn process_adnl(
         subscribers: &Vec<Arc<dyn Subscriber>>,
-        query: &AdnlQueryMessage                                                                    
+        query: &AdnlQueryMessage,
+        peers: &AdnlPeers                                                                    
     ) -> Result<(bool, Option<AdnlMessage>)> {
-        if let (true, answer) = Self::process(subscribers, &query.query[..]).await? {
+        if let (true, answer) = Self::process(subscribers, &query.query[..], peers).await? {
             Self::answer(
                 answer,
                 |answer| AdnlAnswerMessage {
@@ -681,9 +686,10 @@ impl Query {
     /// Process RLDP query
     pub async fn process_rldp(
         subscribers: &Vec<Arc<dyn Subscriber>>,
-        query: &RldpQuery                                                                    
+        query: &RldpQuery,                                                               
+        peers: &AdnlPeers     
     ) -> Result<(bool, Option<RldpAnswer>)> {
-        if let (true, answer) = Self::process(subscribers, &query.data[..]).await? {
+        if let (true, answer) = Self::process(subscribers, &query.data[..], peers).await? {
             Self::answer(
                 answer, 
                 |answer| RldpAnswer {
@@ -710,13 +716,14 @@ impl Query {
 
     async fn process(
         subscribers: &Vec<Arc<dyn Subscriber>>,
-        query: &[u8]                                                                    
+        query: &[u8],
+        peers: &AdnlPeers
     ) -> Result<(bool, Option<TLObject>)> {
         let mut queries = deserialize_bundle(query)?;
         if queries.len() == 1 {
             let mut query = queries.remove(0);
             for subscriber in subscribers.iter() {
-                query = match subscriber.try_consume_query(query).await? {
+                query = match subscriber.try_consume_query(query, peers).await? {
                     QueryResult::Consumed(answer) => return Ok((true, answer)),
                     QueryResult::Rejected(query) => query,
                     QueryResult::RejectedBundle(_) => unreachable!()
@@ -724,7 +731,7 @@ impl Query {
             }
         } else {
             for subscriber in subscribers.iter() {
-                queries = match subscriber.try_consume_query_bundle(queries).await? {
+                queries = match subscriber.try_consume_query_bundle(queries, peers).await? {
                     QueryResult::Consumed(answer) => return Ok((true, answer)),
                     QueryResult::Rejected(_) => unreachable!(),
                     QueryResult::RejectedBundle(queries) => queries
@@ -779,11 +786,19 @@ pub trait Subscriber: Send + Sync {
         Ok(false)
     }
     /// Try consume query: object -> result
-    async fn try_consume_query(&self, object: TLObject) -> Result<QueryResult> {
+    async fn try_consume_query(
+        &self, 
+        object: TLObject, 
+        _peers: &AdnlPeers
+    ) -> Result<QueryResult> {
         Ok(QueryResult::Rejected(object))
     }
     /// Try consume query bundle: objects -> result
-    async fn try_consume_query_bundle(&self, objects: Vec<TLObject>) -> Result<QueryResult> {
+    async fn try_consume_query_bundle(
+        &self, 
+        objects: Vec<TLObject>,
+        _peers: &AdnlPeers
+    ) -> Result<QueryResult> {
         Ok(QueryResult::RejectedBundle(objects))
     }
 }
