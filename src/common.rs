@@ -379,6 +379,12 @@ impl AdnlStreamCrypto {
 
 }
 
+/// ADNL/RLDP answer
+pub enum Answer {
+    Object(TLObject),
+    Raw(Vec<u8>)
+}
+
 /// ADNL key ID (node ID)
 #[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]
 pub struct KeyId([u8; 32]);
@@ -604,7 +610,7 @@ impl KeyOption {
 
 }
 
-/// ADNL query 
+/// ADNL/RLDP Query 
 #[derive(Debug)]
 pub enum Query {
     Received(Vec<u8>),
@@ -703,14 +709,14 @@ impl Query {
     }
 
     fn answer<A>(
-        answer: Option<TLObject>,
+        answer: Option<Answer>,
         convert: impl Fn(Vec<u8>) -> A
     ) -> Result<(bool, Option<A>)> {
-        let answer = if let Some(answer) = answer {
-            Some(serialize(&answer)?)
-        } else {
-            None
-        }; 
+        let answer = match answer {
+            Some(Answer::Object(x)) => Some(serialize(&x)?),
+            Some(Answer::Raw(x)) => Some(x),
+            None => None
+        };
         Ok((true, answer.map(convert)))
     }
 
@@ -718,7 +724,7 @@ impl Query {
         subscribers: &Vec<Arc<dyn Subscriber>>,
         query: &[u8],
         peers: &AdnlPeers
-    ) -> Result<(bool, Option<TLObject>)> {
+    ) -> Result<(bool, Option<Answer>)> {
         let mut queries = deserialize_bundle(query)?;
         if queries.len() == 1 {
             let mut query = queries.remove(0);
@@ -750,10 +756,10 @@ pub type QueryCache = lockfree::map::Map<QueryId, Query>;
 /// ADNL query ID
 pub type QueryId = [u8; 32];
 
-/// ADNL query consumption result
+/// ADNL/RLDP query consumption result
 pub enum QueryResult {
     /// Consumed with optional answer
-    Consumed(Option<TLObject>), 
+    Consumed(Option<Answer>), 
     /// Rejected 
     Rejected(TLObject),         
     /// Rejected bundle
@@ -766,14 +772,14 @@ impl QueryResult {
     pub fn consume<A: IntoBoxed>(answer: A) -> Result<Self> 
         where <A as IntoBoxed>::Boxed: Send + Sync + serde::Serialize + 'static 
     {
-        Ok(QueryResult::Consumed(Some(TLObject::new(answer.into_boxed()))))
+        Ok(QueryResult::Consumed(Some(Answer::Object(TLObject::new(answer.into_boxed())))))
     }
 
     /// Consume boxed helper
     pub fn consume_boxed<A>(answer: A) -> Result<Self> 
         where A: BoxedSerialize + Send + Sync + serde::Serialize + 'static
     {
-        Ok(QueryResult::Consumed(Some(TLObject::new(answer))))
+        Ok(QueryResult::Consumed(Some(Answer::Object(TLObject::new(answer)))))
     }
 
 }
