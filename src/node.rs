@@ -627,6 +627,12 @@ impl Display for IpAddress {
     }
 }
 
+#[derive(Debug)]
+enum Job {
+    Send(SendJob),
+    Stop
+}
+
 struct Peer {
     address: AdnlNodeAddress,
     recv_state: PeerState,
@@ -789,8 +795,8 @@ pub struct AdnlNode {
     channels_wait: Arc<ChannelsSend>,
     peers: lockfree::map::Map<Arc<KeyId>, Arc<Peers>>,
     queries: Arc<QueryCache>, 
-    queue_sender: tokio::sync::mpsc::UnboundedSender<SendJob>,
-    queue_reader: lockfree::queue::Queue<tokio::sync::mpsc::UnboundedReceiver<SendJob>>,
+    queue_sender: tokio::sync::mpsc::UnboundedSender<Job>,
+    queue_reader: lockfree::queue::Queue<tokio::sync::mpsc::UnboundedReceiver<Job>>,
     queue_local_sender: tokio::sync::mpsc::UnboundedSender<(AdnlMessage, Arc<KeyId>)>,
     queue_local_reader: lockfree::queue::Queue<
         tokio::sync::mpsc::UnboundedReceiver<(AdnlMessage, Arc<KeyId>)>
@@ -884,17 +890,12 @@ impl AdnlNode {
             async move {
                 loop {
                     tokio::time::delay_for(Duration::from_millis(Self::TIMEOUT_QUERY_STOP)).await;
-                    if node_stop.stop.load(atomic::Ordering::Relaxed) > 0 {
-                        let close = SendJob { 
-                            destination: 
-                                0x7F0000010000u64 | node_stop.config.ip_address.port() as u64, 
-                            data: Vec::new()
-                        };
-                        if let Err(e) = node_stop.queue_sender.send(close) {
+                    if node_stop.stop.load(atomic::Ordering::Relaxed) > 0 {      
+                        if let Err(e) = node_stop.queue_sender.send(Job::Stop) {
                             log::warn!(target: TARGET, "Cannot close node socket: {}", e);
                         }
-                        let close = (AdnlMessage::Adnl_Message_Nop, KeyId::from_data([0u8; 32]));
-                        if let Err(e) = node_stop.queue_local_sender.send(close) {
+                        let stop = (AdnlMessage::Adnl_Message_Nop, KeyId::from_data([0u8; 32]));
+                        if let Err(e) = node_stop.queue_local_sender.send(stop) {
                             log::warn!(target: TARGET, "Cannot close node loopback: {}", e);
                         }
                         break
@@ -955,11 +956,25 @@ impl AdnlNode {
         tokio::spawn(
             async move {
                 while let Some(job) = queue_reader.recv().await {
+                    let (job, stop) = match job {
+                        Job::Send(job) => (job, false),
+                        Job::Stop => (
+                            // Send closing packet to 127.0.0.1:port
+                            SendJob { 
+                                destination: 
+                                    0x7F0000010000u64 | node_send.config.ip_address.port() as u64,
+                                data: Vec::new()
+                            },
+                            true
+                        )
+                    };
                     if let Err(e) = Self::send(&mut sender, job).await {
                         log::warn!(target: TARGET, "ERROR --> {}", e);
                     }
                     if node_send.stop.load(atomic::Ordering::Relaxed) > 0 {
-                        break
+                        if stop {
+                            break
+                        }
                     }
                 }
                 node_send.stop.fetch_add(1, atomic::Ordering::Relaxed);
@@ -1074,7 +1089,7 @@ impl AdnlNode {
                     }
                 }
             }
-        );
+        );                      
         if let Some(error) = error {
             return Err(error)
         } 
@@ -1149,7 +1164,7 @@ impl AdnlNode {
         }
         let version = Version::get();
         if (list.version > version) || (list.reinit_date > version) {
-            fail!("Address list version is too high")
+            fail!("Address list version is too high: {} vs {}", list.version, version)
         }
         if (list.expire_at != 0) && (list.expire_at < version) {
             fail!("Address list is expired")
@@ -1207,13 +1222,8 @@ log::warn!("Sent query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], quer
         ping.wait().await;                     
         if let Some(removed) = self.queries.remove(&query_id) {
             match removed.val() {
-                Query::Received(answer) => {
-                    /* Restore channel health */
-                    if let Some(channel) = channel {
-                        channel.val().drop.store(0, atomic::Ordering::Relaxed)
-                    }
-                    return Ok(Some(deserialize(answer)?))
-                },
+                Query::Received(answer) => 
+                    return Ok(Some(deserialize(answer)?)),
                 Query::Timeout => {
 log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], query_id[2], query_id[3]);
                     /* Monitor channel health */
@@ -1600,6 +1610,8 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
                     fail!("Internal error when register send channel");
                 }
             }
+            /* Restore channel health */
+            channel.drop.store(0, atomic::Ordering::Relaxed);
             (channel.local_key.clone(), Some(channel.other_key.clone()))
         } else {
             fail!("Received message to unknown key ID {}", base64::encode(&buf[0..32]))
@@ -1764,7 +1776,7 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
             destination: peer.address.ip_address.load(atomic::Ordering::Relaxed),
             data
         };
-        self.queue_sender.send(job)?;
+        self.queue_sender.send(Job::Send(job))?;
         Ok(())
     }
 
