@@ -423,14 +423,24 @@ impl KeyOption {
 
     pub const KEY_ED25519: i32 = 1209251014;
 
-    /// Generate 
-    pub fn with_type_id(type_id: i32) -> Result<([u8; 32], Self)> {
-        if type_id != Self::KEY_ED25519 {
-            fail!("Generate is available for Ed25519 key only")
+    /// Create from Ed25519 expanded secret key
+    pub fn from_ed25519_expanded_secret_key(exp_key: ed25519_dalek::ExpandedSecretKey) -> Self {
+        let pub_key = ed25519_dalek::PublicKey::from(&exp_key).to_bytes();
+        let exp_key = &exp_key.to_bytes();
+        let pvt_key = &exp_key[..32];
+        let pvt_key = from_slice!(pvt_key, 32);
+        let exp_key = &exp_key[32..];
+        let exp_key = from_slice!(exp_key, 32);
+        Self {
+            id: Self::calc_id(Self::KEY_ED25519, &pub_key), 
+            keys: [Some(pub_key), Some(pvt_key), Some(exp_key)],
+            type_id: Self::KEY_ED25519
         }
-        let sec_key = ed25519_dalek::SecretKey::generate(&mut rand::thread_rng());
-        let export = sec_key.to_bytes();
-        Ok((export, Self::from_ed25519_secret_key(sec_key)))
+    }
+
+    /// Create from Ed25519 secret key
+    pub fn from_ed25519_secret_key(key: ed25519_dalek::SecretKey) -> Self {
+        Self::from_ed25519_expanded_secret_key(ed25519_dalek::ExpandedSecretKey::from(&key))
     }
 
     /// Create from private key 
@@ -478,14 +488,6 @@ impl KeyOption {
         )
     }
 
-    /// Create from TL serialized public key 
-    pub fn from_tl_serialized_public_key(src: &[u8]) -> Result<Self> {
-        let pub_key = deserialize(src)?
-            .downcast::<ton::PublicKey>()
-            .map_err(|key| failure::format_err!("Unsupported PublicKey data {:?}", key))?;
-        Self::from_tl_public_key(&pub_key)
-    }
-
     /// Create from TL object with public key 
     pub fn from_tl_public_key(src: &ton::PublicKey) -> Result<Self> {
         if let ton::PublicKey::Pub_Ed25519(key) = src {
@@ -495,24 +497,29 @@ impl KeyOption {
         }
     }
 
-    /// Create from Ed25519 secret key
-    pub fn from_ed25519_secret_key(key: ed25519_dalek::SecretKey) -> Self {
-        Self::from_ed25519_expanded_secret_key(ed25519_dalek::ExpandedSecretKey::from(&key))
+    /// Create from TL serialized public key 
+    pub fn from_tl_serialized_public_key(src: &[u8]) -> Result<Self> {
+        let pub_key = deserialize(src)?
+            .downcast::<ton::PublicKey>()
+            .map_err(|key| failure::format_err!("Unsupported PublicKey data {:?}", key))?;
+        Self::from_tl_public_key(&pub_key)
     }
 
-    /// Create from Ed25519 expanded secret key
-    pub fn from_ed25519_expanded_secret_key(exp_key: ed25519_dalek::ExpandedSecretKey) -> Self {
-        let pub_key = ed25519_dalek::PublicKey::from(&exp_key).to_bytes();
-        let exp_key = &exp_key.to_bytes();
-        let pvt_key = &exp_key[..32];
-        let pvt_key = from_slice!(pvt_key, 32);
-        let exp_key = &exp_key[32..];
-        let exp_key = from_slice!(exp_key, 32);
-        Self {
-            id: Self::calc_id(Self::KEY_ED25519, &pub_key), 
-            keys: [Some(pub_key), Some(pvt_key), Some(exp_key)],
-            type_id: Self::KEY_ED25519
+    /// Create from type and private key 
+    pub fn from_type_and_private_key(
+        type_id: i32, 
+        pvt_key: &[u8; 32]
+    ) -> Result<(KeyOptionJson, Self)> {
+        if type_id != Self::KEY_ED25519 {
+            fail!("Import from private key is available for Ed25519 key only")
         }
+        let sec_key = ed25519_dalek::SecretKey::from_bytes(pvt_key)?;
+        let json = KeyOptionJson {
+            type_id,
+            pub_key: None,
+            pvt_key: Some(base64::encode(pvt_key))
+        };
+        Ok((json, Self::from_ed25519_secret_key(sec_key)))
     }
 
     /// Create from type and public key 
@@ -522,6 +529,20 @@ impl KeyOption {
             keys: [Some(pub_key.clone()), None, None],
             type_id
         }
+    }
+
+    /// Generate 
+    pub fn with_type_id(type_id: i32) -> Result<(KeyOptionJson, Self)> {
+        if type_id != Self::KEY_ED25519 {
+            fail!("Generate is available for Ed25519 key only")
+        }
+        let sec_key = ed25519_dalek::SecretKey::generate(&mut rand::thread_rng());
+        let json = KeyOptionJson {
+            type_id,
+            pub_key: None,
+            pvt_key: Some(base64::encode(&sec_key.to_bytes()))
+        };
+        Ok((json, Self::from_ed25519_secret_key(sec_key)))
     }
 
     /// Get key id 
