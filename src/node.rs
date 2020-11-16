@@ -449,6 +449,31 @@ impl AdnlNodeConfig {
         Ok(ret)
     }    
 
+    /// Construct from IP address and private key data
+    pub fn from_ip_address_and_private_keys(
+        ip_address: &str, 
+        type_id: i32, 
+        keys: Vec<([u8; 32], usize)>
+    ) -> Result<(AdnlNodeConfigJson, Self)> {
+        let mut json_keys = Vec::new();
+        let mut tags_keys = Vec::new();
+        for (key, tag) in keys {
+            let (json, key) = KeyOption::from_type_and_private_key(type_id, &key)?;
+            json_keys.push(
+                AdnlNodeKeyJson {
+                    tag,
+                    data: json
+                }
+            );
+            tags_keys.push((key, tag));
+        }
+        let json = AdnlNodeConfigJson { 
+            ip_address: ip_address.to_string(),
+            keys: json_keys
+        };
+        Ok((json, Self::from_ip_address_and_keys(ip_address, tags_keys)?))
+    } 
+   
     /// Construct from JSON data 
     pub fn from_json(json: &str, as_src: bool) -> Result<Self> {
         let json_config: AdnlNodeConfigJson = serde_json::from_str(json)?;
@@ -478,16 +503,25 @@ impl AdnlNodeConfig {
         ip_address: &str, 
         type_id: i32, 
         tags: Vec<usize>
-    ) -> Result<(Vec<[u8; 32]>, Self)> {
-        let mut exports = Vec::new();
+    ) -> Result<(AdnlNodeConfigJson, Self)> {
+        let mut jsons = Vec::new();
         let mut keys = Vec::new();
         for tag in tags {
-            let (export, key) = KeyOption::with_type_id(type_id)?;
-            exports.push(export);
-            keys.push((key, tag));
+            let (json, key) = KeyOption::with_type_id(type_id)?;
+            jsons.push(
+                AdnlNodeKeyJson {
+                    tag,
+                    data: json
+                }
+            );
+            keys.push((key, tag));            
         }
         let ret = Self::from_ip_address_and_keys(ip_address, keys)?;
-        Ok((exports, ret))
+        let json = AdnlNodeConfigJson { 
+            ip_address: ip_address.to_string(),
+            keys: jsons
+        };
+        Ok((json, ret))
     }    
 
     /// Node IP address
