@@ -823,6 +823,8 @@ type TransferId = [u8; 32];
 
 /// ADNL node
 pub struct AdnlNode {
+    #[cfg(feature = "trace")]
+    answers: lockfree::map::Map<QueryId, Vec<u8>>,
     config: AdnlNodeConfig,
     channels_recv: Arc<ChannelsRecv>,
     channels_send: Arc<ChannelsSend>,
@@ -879,6 +881,8 @@ impl AdnlNode {
         let (queue_local_sender, queue_local_reader) = tokio::sync::mpsc::unbounded_channel();
         let incinerator = lockfree::map::SharedIncin::new();
         let ret = Self {
+            #[cfg(feature = "trace")]
+            answers: lockfree::map::Map::new(),
             config, 
             channels_recv: Arc::new(lockfree::map::Map::new()), 
             channels_send: Arc::new(lockfree::map::Map::with_incin(incinerator.clone())), 
@@ -1483,7 +1487,9 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
         &self,
         subscribers: &Vec<Arc<dyn Subscriber>>,
         msg: &AdnlMessage,
-        peers: &AdnlPeers
+        peers: &AdnlPeers,
+        #[cfg(feature = "trace")]
+        data: Vec<u8>
     ) -> Result<()> {
         let new_msg = if let AdnlMessage::Adnl_Message_Part(part) = msg {
             let transfer_id = get256(&part.hash);
@@ -1548,6 +1554,22 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
         };
         let msg = match new_msg.as_ref().unwrap_or(msg) {
             AdnlMessage::Adnl_Message_Answer(answer) => {
+                #[cfg(feature = "trace")] {    
+                    let query_id = get256(&answer.query_id).clone();
+                    if !add_object_to_map(
+                        &self.answers, 
+                        query_id.clone(), 
+                        || Ok(data.clone())
+                    )? {
+                        fail!(
+                            "INTERNAL ERROR: duplicated answer ({}) {:?} {:?} {:?}",
+                            answer.answer.0.len(), 
+                            query_id,
+                            self.answers.get(&query_id),
+                            data
+                        )
+                    }
+                }
                 self.process_answer(answer, peers.other()).await?;
                 None
             },
@@ -1629,6 +1651,8 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
         buf: &mut Vec<u8>,
         subscribers: &Vec<Arc<dyn Subscriber>>,
     ) -> Result<()> {
+        #[cfg(feature = "trace")]
+        let trace_buf = buf.clone();
         let (local_key, other_key) = if let Some(local_key) = AdnlHandshake::parse_packet(
             &self.config.keys, 
             buf, 
@@ -1656,10 +1680,22 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
         let other_key = self.check_packet(&pkt, &local_key, other_key)?;        
         let peers = AdnlPeers::with_keys(local_key, other_key);
         if let Some(msg) = pkt.message() { 
-            self.process(subscribers, msg, &peers).await?
+            self.process(
+                subscribers, 
+                msg, 
+                &peers, 
+                #[cfg(feature = "trace")]
+                trace_buf
+            ).await?
         } else if let Some(msgs) = pkt.messages() {
             for msg in msgs.deref() {
-                self.process(subscribers, msg, &peers).await?;
+                self.process(
+                    subscribers, 
+                    msg, 
+                    &peers, 
+                    #[cfg(feature = "trace")]
+                    trace_buf.clone()
+                ).await?;
             }
         } else {
             // Specifics of implementation. 
@@ -1858,7 +1894,11 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
         transfer_id: &TransferId, 
         transfer: &Transfer
     ) -> Result<Option<AdnlMessage>> {
-        let mut received = transfer.received.load(atomic::Ordering::Relaxed);
+        let mut received = transfer.received.compare_and_swap(
+            transfer.total, 
+            2 * transfer.total, 
+            atomic::Ordering::Relaxed
+        );
         if received > transfer.total {
             fail!("Invalid ADNL part transfer: size mismatch")
         }
