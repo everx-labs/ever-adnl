@@ -674,6 +674,8 @@ struct Peer {
 }
 
 struct PeerState {
+    index: AtomicU64,
+    masks: [AtomicU64; 8],
     reinit_date: AtomicI32,
     seqno: AtomicU64,
     window: Option<AtomicU64>
@@ -681,11 +683,20 @@ struct PeerState {
 
 impl PeerState {
 
+    const INDEX_MASK: u8 = 0xFF;
+    const IN_TRANSIT: u64 = 0xFFFFFFFFFFFFFFFF;
+/*    
     const WINDOW: i8 = 32;
     const MARKER: i8 = 64 - Self::WINDOW;
+*/
 
     fn for_receive_with_reinit_date(reinit_date: i32) -> Self {
         Self {
+            index: AtomicU64::new(0),
+            masks: [
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)
+            ],
             reinit_date: AtomicI32::new(reinit_date),
             seqno: AtomicU64::new(0),
             window: Some(AtomicU64::new(0))
@@ -694,9 +705,14 @@ impl PeerState {
 
     fn for_send() -> Self {
         Self {
+            index: AtomicU64::new(0),
+            masks: [
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+                AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)
+            ],
             window: None,
             reinit_date: AtomicI32::new(0),
-            seqno: AtomicU64::new(0)    
+            seqno: AtomicU64::new(0)
         }
     }
 
@@ -709,17 +725,148 @@ impl PeerState {
     fn reset_reinit_date(&self, reinit_date: i32) {
         self.reinit_date.store(reinit_date, atomic::Ordering::Relaxed)
     }
-    fn reset_seqno(&self, seqno: u64) {
-        self.seqno.store(seqno, atomic::Ordering::Relaxed);
-        if let Some(window) = &self.window {
-            window.store(seqno as u32 as u64, atomic::Ordering::Relaxed)
-        }
-    }
     fn seqno(&self) -> u64 {
         self.seqno.load(atomic::Ordering::Relaxed)
     }
 
-    fn save_seqno(&self, seqno: u64) -> Result<()> {
+    async fn reset_seqno(&self, seqno: u64) -> Result<()> {
+        loop {
+            let index = self.index.load(atomic::Ordering::Relaxed);
+            if index == Self::IN_TRANSIT {
+                tokio::task::yield_now().await;
+                continue
+            }
+            if self.index.compare_and_swap(
+                index, 
+                Self::IN_TRANSIT, 
+                atomic::Ordering::Relaxed
+            ) != index {
+                continue
+            }
+            break
+        }
+        for i in 0..8 {
+            self.masks[i].store(
+                if i == 4 {
+                    1
+                } else {
+                    0
+                }, 
+                atomic::Ordering::Relaxed
+            )
+        }
+        self.seqno.store(seqno, atomic::Ordering::Relaxed);
+        if let Some(window) = &self.window {
+            window.store(seqno as u32 as u64, atomic::Ordering::Relaxed)
+        }
+        if self.index.compare_and_swap(
+            Self::IN_TRANSIT, 
+            seqno & !(Self::INDEX_MASK as u64),
+            atomic::Ordering::Relaxed
+        ) != Self::IN_TRANSIT {
+            fail!("INTERNAL ERROR: ADNL packet seqno reset mismatch ({:x})", seqno)
+        }
+        Ok(())
+    }
+
+    async fn save_seqno(&self, seqno: u64) -> Result<()> {
+        let seqno_masked = seqno & Self::INDEX_MASK as u64;
+        let seqno_normalized = seqno & !(Self::INDEX_MASK as u64); 
+        loop {
+            let index = self.index.load(atomic::Ordering::Relaxed);
+            if index == Self::IN_TRANSIT {
+                tokio::task::yield_now().await;
+                continue
+            }
+            let index_masked = index & Self::INDEX_MASK as u64;
+            let index_normalized = index & !(Self::INDEX_MASK as u64);
+            if index_normalized > seqno_normalized + Self::INDEX_MASK as u64 + 1 {
+                // Out of the window
+                fail!(
+                    "ADNL packet with seqno {:x} is too old ({:x})", 
+                    seqno, 
+                    index_normalized
+                )
+            }
+            // Masks format: 
+            // lower0, lower1, lower2, lower3, upper0, upper1, upper2, upper3
+            let mask = 1 << seqno_masked % 64;
+            let mask_offset = if index_normalized > seqno_normalized {
+                // Lower part of the window
+                Some(0)
+            } else if index_normalized == seqno_normalized {
+                // Upper part of the window
+                Some(4)
+            } else {
+                None
+            };
+            let next_index = if let Some(mask_offset) = mask_offset {
+                let mask_offset = mask_offset + seqno_masked as usize / 64;
+                let already_received = 
+                    self.masks[mask_offset].load(atomic::Ordering::Relaxed) & mask;
+                if self.index.load(atomic::Ordering::Relaxed) != index {
+log::warn!(target: TARGET, "ADNL4");
+                    continue
+                }
+                if already_received != 0 {
+                    // Already received
+                    fail!("ADNL packet with seqno {:x} was already received", seqno)
+                }
+                if self.index.compare_and_swap(
+                    index, 
+                    Self::IN_TRANSIT, 
+                    atomic::Ordering::Relaxed
+                ) != index {
+log::warn!(target: TARGET, "ADNL5");
+                    continue
+                }
+                self.masks[mask_offset].fetch_or(mask, atomic::Ordering::Relaxed);
+                index
+            } else {
+                if self.index.compare_and_swap(
+                    index, 
+                    Self::IN_TRANSIT, 
+                    atomic::Ordering::Relaxed
+                ) != index {
+log::warn!(target: TARGET, "ADNL6");
+                    continue
+                }
+                if index_normalized + 1 == seqno_normalized {
+                    for i in 0..4 {
+                        self.masks[i].store(
+                            self.masks[i + 4].load(atomic::Ordering::Relaxed),
+                            atomic::Ordering::Relaxed
+                        )
+                    }
+                    for i in 4..8 {
+                        self.masks[i].store(0, atomic::Ordering::Relaxed)
+                    }
+                } else {
+                    for i in 0..8 {
+                        self.masks[i].store(0, atomic::Ordering::Relaxed)
+                    }
+                }
+                seqno_normalized
+            };
+            let last_seqno = self.seqno.load(atomic::Ordering::Relaxed);
+            if last_seqno < seqno {
+                self.seqno.store(seqno, atomic::Ordering::Relaxed)
+            }
+            let index_masked = (index_masked + 1) & !(Self::INDEX_MASK as u64);
+            if self.index.compare_and_swap(
+                Self::IN_TRANSIT, 
+                next_index | index_masked,
+                atomic::Ordering::Relaxed
+            ) != Self::IN_TRANSIT {
+                fail!("INTERNAL ERROR: ADNL packet seqno sync mismatch ({:x})", seqno)
+            }
+            break
+        }
+        Ok(())
+    }
+
+/*
+    fn save_seqno_old(&self, seqno: u64) -> Result<()> {
         let window = self.window.as_ref().ok_or_else(
             || error!("INTERNAL ERROR: unexpected save_seqno() call")
         )?;
@@ -799,6 +946,7 @@ impl PeerState {
             .compare_exchange(old, new, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
             .is_ok()
     }
+*/
 
 }
 
@@ -846,14 +994,14 @@ impl AdnlNode {
 
     const CLOCK_TOLERANCE: i32 = 60;     // Seconds
     const MAX_ADNL_MESSAGE: usize = 1024;
-    const MAX_QUERY_DROPS: u32 = 10;    
     const SIZE_BUFFER: usize = 2048;
-    const TIMEOUT_ADDRESS: i32 = 1000;   // Seconds
-    const TIMEOUT_QUERY_MIN: u64 = 500;  // Milliseconds
-    const TIMEOUT_QUERY_MAX: u64 = 5000; // Milliseconds
-    const TIMEOUT_QUERY_STOP: u64 = 1;   // Milliseconds
-    const TIMEOUT_SHUTDOWN: u64 = 2000;  // Milliseconds
-    const TIMEOUT_TRANSFER: u64 = 3;     // Seconds
+    const TIMEOUT_ADDRESS: i32 = 1000;       // Seconds
+    const TIMEOUT_CHANNEL_RESET: u32 = 5000; // Milliseconds
+    const TIMEOUT_QUERY_MIN: u64 = 500;      // Milliseconds
+    const TIMEOUT_QUERY_MAX: u64 = 5000;     // Milliseconds
+    const TIMEOUT_QUERY_STOP: u64 = 1;       // Milliseconds
+    const TIMEOUT_SHUTDOWN: u64 = 2000;      // Milliseconds
+    const TIMEOUT_TRANSFER: u64 = 3;         // Seconds
 
     /// Constructor
     pub async fn with_config(mut config: AdnlNodeConfig) -> Result<Arc<Self>> {
@@ -1266,8 +1414,13 @@ log::warn!("Sent query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], quer
 log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], query_id[2], query_id[3]);
                     /* Monitor channel health */
                     if let Some(channel) = channel {
-                        let drops = channel.val().drop.fetch_add(1, atomic::Ordering::Relaxed);
-                        if drops >= Self::MAX_QUERY_DROPS {
+                        let now = Version::get() as u32;
+                        let was = channel.val().drop.compare_and_swap(
+                            0,
+                            now + Self::TIMEOUT_CHANNEL_RESET,
+                            atomic::Ordering::Relaxed
+                        );
+                        if (was > 0) && (was < now) {
                             self.reset_peers(peers)? 
                         }
                     }
@@ -1285,6 +1438,7 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
         let peer = peer_list.get(peers.other()).ok_or_else(
             || error!("Try to reset unknown peer pair {} -> {}", peers.local(), peers.other())
         )?;
+        log::warn!(target: TARGET, "Resetting peer pair {} -> {}", peers.local(), peers.other());
         let peer = peer.val();
         let address = AdnlNodeAddress::from_ip_address_and_key(
             IpAddress(peer.address.ip_address.load(atomic::Ordering::Relaxed)),
@@ -1323,7 +1477,7 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
         self.send_message(msg, peers)
     }
 
-    fn check_packet(
+    async fn check_packet(
         &self,
         packet: &AdnlPacketContents, 
         local_key: &Arc<KeyId>,
@@ -1400,8 +1554,8 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
                 } else {
                     peer.send_state.reset_reinit_date(*reinit_date);
                     if other_reinit_date != 0 {
-                        peer.send_state.reset_seqno(0);
-                        peer.recv_state.reset_seqno(0);
+                        peer.send_state.reset_seqno(0).await?;
+                        peer.recv_state.reset_seqno(0).await?;
                     }
                 },
                 Ordering::Less => 
@@ -1409,7 +1563,7 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
             }
         }
         if let Some(seqno) = packet.seqno() {
-            if let Err(e) = peer.recv_state.save_seqno(*seqno as u64) {
+            if let Err(e) = peer.recv_state.save_seqno(*seqno as u64).await {
                 fail!("Peer {} ({:?}): {}", ret, other_key, e)
             }
         }
@@ -1677,7 +1831,7 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
         let pkt = deserialize(&buf[..])?
             .downcast::<AdnlPacketContents>()
             .map_err(|pkt| failure::format_err!("Unsupported ADNL packet format {:?}", pkt))?;
-        let other_key = self.check_packet(&pkt, &local_key, other_key)?;        
+        let other_key = self.check_packet(&pkt, &local_key, other_key).await?;        
         let peers = AdnlPeers::with_keys(local_key, other_key);
         if let Some(msg) = pkt.message() { 
             self.process(
@@ -1900,9 +2054,14 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
             atomic::Ordering::Relaxed
         );
         if received > transfer.total {
-            fail!("Invalid ADNL part transfer: size mismatch")
+            fail!(
+                "Invalid ADNL part transfer: size mismatch {} vs. total {}",
+                received,
+                transfer.total
+            )
         }
         if received == transfer.total {
+            log::debug!("Finished ADNL part {} (total {})", received, transfer.total);
             received = 0;
             let mut buf = Vec::with_capacity(transfer.total);
             while received < transfer.total {
@@ -1923,9 +2082,9 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
                 .map_err(|msg| error!("Unsupported ADNL messge {:?}", msg))?;
             Ok(Some(msg))
         } else {
+            log::debug!("Received ADNL part {} (total {})", received, transfer.total);
             Ok(None)
         }
     }
 
 }
-                        	
