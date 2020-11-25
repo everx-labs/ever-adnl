@@ -40,5 +40,4 @@ log4rs = "0.8.3"
 client = []
 server = []
 node   = ["external-ip"]
-trace  = []
 
