@@ -37,7 +37,7 @@ impl AdnlClientConfig {
     pub fn from_json(json: &str) -> Result<Self> {
         let json_config: AdnlClientConfigJson = serde_json::from_str(json)?;
         let client_key = if let Some(key) = &json_config.client_key {
-            Some(KeyOption::from_public_key(key)?)
+            Some(KeyOption::from_private_key(key)?)
         } else {
             None
         };
