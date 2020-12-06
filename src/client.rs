@@ -24,7 +24,7 @@ pub struct AdnlClientConfig {
 }
 
 #[derive(serde::Deserialize)]
-struct AdnlClientConfigJson {
+pub struct AdnlClientConfigJson {
     client_key: Option<KeyOptionJson>,
     server_address: String,
     server_key: KeyOptionJson,
@@ -33,9 +33,12 @@ struct AdnlClientConfigJson {
 
 impl AdnlClientConfig {
 
-    /// Costructs new configuration from JSON data
     pub fn from_json(json: &str) -> Result<Self> {
         let json_config: AdnlClientConfigJson = serde_json::from_str(json)?;
+        Self::from_json_config(json_config)
+    }
+    /// Costructs new configuration from JSON data
+    pub fn from_json_config(json_config: AdnlClientConfigJson) -> Result<Self> {
         let client_key = if let Some(key) = &json_config.client_key {
             Some(KeyOption::from_private_key(key)?)
         } else {
