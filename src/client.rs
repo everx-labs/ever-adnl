@@ -23,7 +23,7 @@ pub struct AdnlClientConfig {
     timeouts: Timeouts
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, serde::Serialize)]
 pub struct AdnlClientConfigJson {
     client_key: Option<KeyOptionJson>,
     server_address: String,
