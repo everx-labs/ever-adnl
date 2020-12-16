@@ -15,14 +15,6 @@ use ton_api::{
 };
 use ton_types::{fail, Result};
 
-/// ADNL client configuration
-pub struct AdnlClientConfig {
-    client_key: Option<KeyOption>,
-    server_address: SocketAddr,
-    server_key: KeyOption,
-    timeouts: Timeouts
-}
-
 #[derive(serde::Deserialize, serde::Serialize)]
 pub struct AdnlClientConfigJson {
     client_key: Option<KeyOptionJson>,
@@ -31,30 +23,64 @@ pub struct AdnlClientConfigJson {
     timeouts: Option<Timeouts>
 }
 
+impl AdnlClientConfigJson {
+    pub fn with_params(server: &str, server_key: KeyOptionJson, timeouts: Option<Timeouts>) -> Self {
+        AdnlClientConfigJson {
+            client_key: None,
+            server_address: server.to_string(),
+            server_key: server_key,
+            timeouts: timeouts
+        }
+    }
+}
+
+/// ADNL client configuration
+pub struct AdnlClientConfig {
+    client_key: Option<KeyOption>,
+    server_address: SocketAddr,
+    server_key: KeyOption,
+    timeouts: Timeouts
+}
+
 impl AdnlClientConfig {
 
-    pub fn from_json(json: &str) -> Result<Self> {
+    /// Costructs new configuration from JSON string
+    pub fn from_json(json: &str) -> Result<(Option<AdnlClientConfigJson>, Self)> {
         let json_config: AdnlClientConfigJson = serde_json::from_str(json)?;
         Self::from_json_config(json_config)
     }
+    
     /// Costructs new configuration from JSON data
-    pub fn from_json_config(json_config: AdnlClientConfigJson) -> Result<Self> {
+    pub fn from_json_config(
+        json_config: AdnlClientConfigJson
+    ) -> Result<(Option<AdnlClientConfigJson>, Self)> {
+        let server_key = KeyOption::from_public_key(&json_config.server_key)?;
+        let mut result_config = None;
         let client_key = if let Some(key) = &json_config.client_key {
             Some(KeyOption::from_private_key(key)?)
         } else {
-            None
+            let (json, key) = KeyOption::with_type_id(KeyOption::KEY_ED25519)?;
+            result_config = Some(
+                AdnlClientConfigJson {
+                    client_key: Some(json),
+                    server_address: json_config.server_address.clone(),
+                    server_key: json_config.server_key,
+                    timeouts: json_config.timeouts.clone()
+                }
+            );
+            Some(key)
         };
         let ret = AdnlClientConfig {
             client_key,
             server_address: json_config.server_address.parse()?,
-            server_key: KeyOption::from_public_key(&json_config.server_key)?,
+            server_key,
             timeouts: if let Some(timeouts) = json_config.timeouts {
                 timeouts
             } else {
                 Timeouts::default()
             }
         };
-        Ok(ret)
+        Ok((result_config, ret))
     }
 
     /// Get timeouts
