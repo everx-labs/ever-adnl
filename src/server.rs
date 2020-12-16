@@ -13,14 +13,6 @@ use futures::prelude::*;
 use ton_api::ton::adnl::Message as AdnlMessage;
 use ton_types::{error, fail, Result};
 
-/// ADNL server configuration
-pub struct AdnlServerConfig {
-    address: SocketAddr,
-    clients: Arc<Option<lockfree::map::Map<[u8; 32], u8>>>,
-    server_key: Arc<lockfree::map::Map<Arc<KeyId>, Arc<KeyOption>>>,
-    timeouts: Timeouts
-}
-
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 enum AdnlServerClients {
@@ -34,6 +26,30 @@ pub struct AdnlServerConfigJson {
     clients: AdnlServerClients,
     server_key: KeyOptionJson,
     timeouts: Option<Timeouts>
+}
+
+impl AdnlServerConfigJson {
+    pub fn with_params(
+        address: String,
+        server_key: KeyOptionJson,
+        client_keys: Vec<KeyOptionJson>,
+        timeouts: Option<Timeouts>
+    )-> Self {
+        AdnlServerConfigJson {
+            address: address,
+            clients: AdnlServerClients::List(client_keys),
+            server_key: server_key,
+            timeouts: timeouts
+        }
+    }
+}
+
+/// ADNL server configuration
+pub struct AdnlServerConfig {
+    address: SocketAddr,
+    clients: Arc<Option<lockfree::map::Map<[u8; 32], u8>>>,
+    server_key: Arc<lockfree::map::Map<Arc<KeyId>, Arc<KeyOption>>>,
+    timeouts: Timeouts
 }
 
 impl AdnlServerConfig {
