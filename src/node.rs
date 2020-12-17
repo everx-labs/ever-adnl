@@ -1367,7 +1367,14 @@ impl AdnlNode {
 
     /// Add key
     pub fn add_key(&self, key: KeyOption, tag: usize) -> Result<Arc<KeyId>> {
-        self.config.add_key(key, tag)
+        let ret = self.config.add_key(key, tag)?;
+        add_object_to_map(
+            &self.peers,
+            ret.clone(),
+            || Ok(Arc::new(lockfree::map::Map::new())
+)
+        )?;
+        Ok(ret)
     }
     
     /// Add peer 
@@ -1536,8 +1543,11 @@ log::warn!("Sent query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], quer
             async move {
                 let timeout = timeout.unwrap_or(Self::TIMEOUT_QUERY_MAX);
                 tokio::time::delay_for(Duration::from_millis(timeout)).await;
-                if let Err(e) = Self::update_query(&queries, query_id, None).await {
-                    log::warn!(target: TARGET, "ERROR: {}", e)
+                match Self::update_query(&queries, query_id, None).await {
+                    Err(e) => log::warn!(target: TARGET, "ERROR: {}", e),
+                    Ok(true) => 
+log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], query_id[2], query_id[3]),
+                    _ => ()
                 }
             }
         );
@@ -1547,7 +1557,6 @@ log::warn!("Sent query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], quer
                 Query::Received(answer) => 
                     return Ok(Some(deserialize(answer)?)),
                 Query::Timeout => {
-log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], query_id[2], query_id[3]);
                     /* Monitor channel health */
                     if let Some(channel) = channel {
                         let now = Version::get() as u32;
@@ -1964,7 +1973,12 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
             channel.drop.store(0, atomic::Ordering::Relaxed);
             (channel.local_key.clone(), Some(channel.other_key.clone()))
         } else {
-            fail!("Received message to unknown key ID {}", base64::encode(&buf[0..32]))
+            log::trace!(
+                target: TARGET,
+                "Received message to unknown key ID {}", 
+                base64::encode(&buf[0..32])
+            );
+            return Ok(())
         };
         let pkt = deserialize(&buf[..])?
             .downcast::<AdnlPacketContents>()
