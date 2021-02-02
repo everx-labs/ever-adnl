@@ -176,12 +176,14 @@ impl AddressCache {
                 let upper = self.upper.fetch_add(1, atomic::Ordering::Relaxed);
                 index = upper;
                 if index >= self.limit {
+                    if index >= self.limit * 2 {
+                        self.upper.compare_and_swap(
+                            upper + 1, 
+                            index - self.limit + 1, 
+                            atomic::Ordering::Relaxed
+                        );
+                    }
                     index %= self.limit;
-                    self.upper.compare_and_swap(
-                        upper + 1, 
-                        index, 
-                        atomic::Ordering::Relaxed
-                    );
                 }
                 Ok(index)
             }
