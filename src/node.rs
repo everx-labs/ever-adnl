@@ -10,6 +10,7 @@ use crate::{
 use aes_ctr::stream_cipher::SyncStreamCipher;
 use rand::Rng;
 use sha2::Digest;
+use socket2::{Domain, Socket, Type};
 use std::{
     cmp::{min, Ordering}, fmt::{self, Debug, Display, Formatter}, 
     net::{IpAddr, Ipv4Addr, SocketAddr}, ops::Deref, 
@@ -1199,7 +1200,18 @@ impl AdnlNode {
         let mut queue_local_reader = node.queue_local_reader.pop().ok_or_else(
             || error!("ADNL node already started")
         )?;
-        let (mut receiver, mut sender) = 
+        let (mut receiver, mut sender) = {
+      	    let s = Socket::new(Domain::ipv4(), Type::dgram(), None)?;
+            s.set_send_buffer_size(1 << 24)?;
+            s.set_recv_buffer_size(1 << 24)?;
+            s.bind(
+                &SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::UNSPECIFIED), 
+                    node.config.ip_address.port()
+                ).into()
+            )?;
+            tokio::net::UdpSocket::from_std(s.into())?.split()
+/* 
             tokio::net::UdpSocket::bind(
                 &SocketAddr::new(
                     IpAddr::V4(Ipv4Addr::UNSPECIFIED), 
@@ -1208,6 +1220,8 @@ impl AdnlNode {
             )
             .await?
             .split();
+*/
+        };
         let node_stop = node.clone();
         // Stopping watchdog
         tokio::spawn(
