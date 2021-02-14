@@ -178,11 +178,12 @@ impl AddressCache {
                 index = upper;
                 if index >= self.limit {
                     if index >= self.limit * 2 {
-                        self.upper.compare_and_swap(
+                        self.upper.compare_exchange(
                             upper + 1, 
                             index - self.limit + 1, 
+                            atomic::Ordering::Relaxed,
                             atomic::Ordering::Relaxed
-                        );
+                        ).ok();
                     }
                     index %= self.limit;
                 }
@@ -822,22 +823,24 @@ log::warn!(target: TARGET, "ADNL4");
                     );
                     return Ok(false)
                 }
-                if self.index.compare_and_swap(
+                if self.index.compare_exchange(
                     index, 
                     Self::IN_TRANSIT, 
+                    atomic::Ordering::Relaxed,
                     atomic::Ordering::Relaxed
-                ) != index {
+                ).is_err() {
 log::warn!(target: TARGET, "ADNL5");
                     continue
                 }
                 self.masks[mask_offset].fetch_or(mask, atomic::Ordering::Relaxed);
                 index
             } else {
-                if self.index.compare_and_swap(
+                if self.index.compare_exchange(
                     index, 
                     Self::IN_TRANSIT, 
+                    atomic::Ordering::Relaxed,
                     atomic::Ordering::Relaxed
-                ) != index {
+                ).is_err() {
 log::warn!(target: TARGET, "ADNL6");
                     continue
                 }
@@ -863,11 +866,12 @@ log::warn!(target: TARGET, "ADNL6");
                 self.seqno.store(seqno, atomic::Ordering::Relaxed)
             }
             let index_masked = (index_masked + 1) & !(Self::INDEX_MASK as u64);
-            if self.index.compare_and_swap(
+            if self.index.compare_exchange(
                 Self::IN_TRANSIT, 
                 next_index | index_masked,
+                atomic::Ordering::Relaxed,
                 atomic::Ordering::Relaxed
-            ) != Self::IN_TRANSIT {
+            ).is_err() {
                 fail!("INTERNAL ERROR: Peer packet seqno sync mismatch ({:x})", seqno)
             }
             break
@@ -882,11 +886,12 @@ log::warn!(target: TARGET, "ADNL6");
                 tokio::task::yield_now().await;
                 continue
             }
-            if self.index.compare_and_swap(
+            if self.index.compare_exchange(
                 index, 
                 Self::IN_TRANSIT, 
+                atomic::Ordering::Relaxed,
                 atomic::Ordering::Relaxed
-            ) != index {
+            ).is_err() {
                 continue
             }
             break
@@ -907,11 +912,12 @@ log::warn!(target: TARGET, "ADNL6");
             window.store(seqno as u32 as u64, atomic::Ordering::Relaxed)
         }
 */
-        if self.index.compare_and_swap(
+        if self.index.compare_exchange(
             Self::IN_TRANSIT, 
             seqno & !(Self::INDEX_MASK as u64),
+            atomic::Ordering::Relaxed,
             atomic::Ordering::Relaxed
-        ) != Self::IN_TRANSIT {
+        ).is_err() {
             fail!("INTERNAL ERROR: peer packet seqno reset mismatch ({:x})", seqno)
         }
         Ok(())
@@ -1576,11 +1582,12 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
                     /* Monitor channel health */
                     if let Some(channel) = channel {
                         let now = Version::get() as u32;
-                        let was = channel.val().drop.compare_and_swap(
+                        let was = channel.val().drop.compare_exchange(
                             0,
                             now + Self::TIMEOUT_CHANNEL_RESET,
+                            atomic::Ordering::Relaxed,
                             atomic::Ordering::Relaxed
-                        );
+                        ).unwrap_or_else(|was| was);
                         if (was > 0) && (was < now) {
                             self.reset_peers(peers)? 
                         }
@@ -2226,11 +2233,12 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
         transfer_id: &TransferId, 
         transfer: &Transfer
     ) -> Result<Option<AdnlMessage>> {
-        let mut received = transfer.received.compare_and_swap(
+        let mut received = transfer.received.compare_exchange(
             transfer.total, 
             2 * transfer.total, 
+            atomic::Ordering::Relaxed,
             atomic::Ordering::Relaxed
-        );
+        ).unwrap_or_else(|was| was);
         if received > transfer.total {
             fail!(
                 "Invalid ADNL part transfer: size mismatch {} vs. total {}",
