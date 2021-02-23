@@ -229,21 +229,21 @@ impl AddressCache {
         let mut i = min(max, n);
         while i > 0 {
             if let Some(key_id) = self.index.get(&rand::thread_rng().gen_range(0, max)) {
-                let mut key_id = Some(key_id.val());
-                if skip == key_id {
-                    if (n >= max) && !check {
-                        check = true;
-                        i -= 1;
-                    }
-                    continue;
-                }
-                for x in ret.iter() {
-                    if Some(x) == key_id {
-                        key_id = None;
-                        break
+                let key_id = key_id.val();
+                if let Some(skip) = skip {
+                    if skip == key_id {   
+                        // If there are not enough items in cache, 
+                        // reduce limit for skipped element
+                        if (n >= max) && !check {
+                            check = true;
+                            i -= 1;
+                        }
+                        continue
                     }
                 }
-                if let Some(key_id) = key_id {
+                if ret.contains(key_id) {
+                    continue
+                } else {
                     ret.push(key_id.clone());
                     i -= 1;
                 }
@@ -773,7 +773,7 @@ impl PeerHistory {
     }
 
     /// Update with specified SEQ number
-    pub async fn update(&self, seqno: u64) -> Result<bool> {
+    pub async fn update(&self, seqno: u64, target: &str) -> Result<bool> {
         let seqno_masked = seqno & Self::INDEX_MASK as u64;
         let seqno_normalized = seqno & !(Self::INDEX_MASK as u64); 
         loop {
@@ -787,7 +787,7 @@ impl PeerHistory {
             if index_normalized > seqno_normalized + Self::INDEX_MASK as u64 + 1 {
                 // Out of the window
                 log::trace!(
-                    target: TARGET,
+                    target: target,
                     "Peer packet with seqno {:x} is too old ({:x})", 
                     seqno, 
                     index_normalized
@@ -811,13 +811,13 @@ impl PeerHistory {
                 let already_received = 
                     self.masks[mask_offset].load(atomic::Ordering::Relaxed) & mask;
                 if self.index.load(atomic::Ordering::Relaxed) != index {
-log::warn!(target: TARGET, "ADNL4");
+log::warn!(target: target, "ADNL4");
                     continue
                 }
                 if already_received != 0 {
                     // Already received
                     log::trace!(
-                        target: TARGET, 
+                        target: target, 
                         "Peer packet with seqno {:x} was already received", 
                         seqno
                     );
@@ -829,7 +829,7 @@ log::warn!(target: TARGET, "ADNL4");
                     atomic::Ordering::Relaxed,
                     atomic::Ordering::Relaxed
                 ).is_err() {
-log::warn!(target: TARGET, "ADNL5");
+log::warn!(target: target, "ADNL5");
                     continue
                 }
                 self.masks[mask_offset].fetch_or(mask, atomic::Ordering::Relaxed);
@@ -841,7 +841,7 @@ log::warn!(target: TARGET, "ADNL5");
                     atomic::Ordering::Relaxed,
                     atomic::Ordering::Relaxed
                 ).is_err() {
-log::warn!(target: TARGET, "ADNL6");
+log::warn!(target: target, "ADNL6");
                     continue
                 }
                 if index_normalized + Self::INDEX_MASK as u64 + 1 == seqno_normalized {
@@ -907,11 +907,6 @@ log::warn!(target: TARGET, "ADNL6");
             )
         }
         self.seqno.store(seqno, atomic::Ordering::Relaxed);
-/*
-        if let Some(window) = &self.window {
-            window.store(seqno as u32 as u64, atomic::Ordering::Relaxed)
-        }
-*/
         if self.index.compare_exchange(
             Self::IN_TRANSIT, 
             seqno & !(Self::INDEX_MASK as u64),
@@ -928,7 +923,6 @@ log::warn!(target: TARGET, "ADNL6");
 struct PeerState {
     history: PeerHistory,
     reinit_date: AtomicI32,
-//    window: Option<AtomicU64>,
     #[cfg(feature = "trace")]
     start: Instant,
     #[cfg(feature = "trace")]
@@ -941,16 +935,10 @@ struct PeerState {
 
 impl PeerState {
 
-/*    
-    const WINDOW: i8 = 32;
-    const MARKER: i8 = 64 - Self::WINDOW;
-*/
-
     fn for_receive_with_reinit_date(reinit_date: i32) -> Self {
         Self {
             history: PeerHistory::new(),
             reinit_date: AtomicI32::new(reinit_date),
-//            window: Some(AtomicU64::new(0)),
             #[cfg(feature = "trace")]
             start: Instant::now(),
             #[cfg(feature = "trace")]
@@ -966,7 +954,6 @@ impl PeerState {
         Self {
             history: PeerHistory::new(),
             reinit_date: AtomicI32::new(0),
-//            window: None,
             #[cfg(feature = "trace")]
             start: Instant::now(),
             #[cfg(feature = "trace")]
@@ -994,7 +981,7 @@ impl PeerState {
         self.history.seqno.load(atomic::Ordering::Relaxed)
     }
     async fn save_seqno(&self, seqno: u64) -> Result<bool> {
-        self.history.update(seqno).await
+        self.history.update(seqno, TARGET).await
     }
 
     #[cfg(feature = "trace")]
@@ -1009,89 +996,6 @@ impl PeerState {
             false
         }
     }
-
-/*
-    fn save_seqno_old(&self, seqno: u64) -> Result<()> {
-        let window = self.window.as_ref().ok_or_else(
-            || error!("INTERNAL ERROR: unexpected save_seqno() call")
-        )?;
-        loop {
-            let old_seqno = self.seqno.load(atomic::Ordering::Relaxed);
-            match Self::evaluate(old_seqno, seqno, false)? {
-                // Older packet
-                x if x < 0 => {
-                    let mask = window.load(atomic::Ordering::Relaxed);
-                    if mask as u32 != old_seqno as u32 {
-                        // Re-read state
-                        continue
-                    } 
-                    let bit = 1u64 << (-x + Self::MARKER);
-                    if mask & bit != 0 {
-                        // Already received
-                        fail!("ADNL packet with seqno {} already received {:x}", seqno, mask)  
-                    }
-                    if !Self::try_set(window, mask, mask | bit) {
-                        // Re-read state
-                        continue
-                    }
-                },
-                // Newer packet
-                _ => {
-                    if !Self::try_set(&self.seqno, old_seqno, seqno) {
-                        // Re-read state
-                        continue
-                    }
-                    loop {
-                        let mask = window.load(atomic::Ordering::Relaxed);
-                        let new_mask = match Self::evaluate(mask, seqno, true)? {
-                            x if x < 0 => mask | (1u64 << (-x + Self::MARKER)),
-                            x => (seqno as u32) as u64 | (1u64 << Self::MARKER) | 
-                            if x >= Self::WINDOW {
-                                0
-                            } else {
-                                (mask & 0xFFFFFFFF00000000u64) << x
-                            } 
-                        };
-                        if Self::try_set(window, mask, new_mask) {
-                            break
-                        }
-                    } 
-                }
-            }
-            break
-        }
-        Ok(())
-    }
-
-    fn evaluate(old: u64, new: u64, as_window: bool) -> Result<i8> {
-        let diff = if as_window {
-            (new as u32 as i64 - old as u32 as i64) as i32
-        } else {
-            let diff = new as i64 - old as i64;
-            if diff >= (1i64 << Self::MARKER) {
-                fail!("ADNL packet with seqno {} is too new ({})", new, old)
-            }
-            diff as i32
-        };
-        match diff {
-            // Already received
-            0 => fail!("ADNL packet with seqno {} just received", new),
-            // Too late
-            x if x <= -Self::WINDOW as i32 => 
-                fail!("ADNL packet with seqno {} is too old ({})", new, old),
-            // Not too late
-            x if x < 0 => Ok(x as i8),
-            // Just update
-            x => Ok(min(x, Self::WINDOW as i32) as i8)
-        }
-    }
-
-    fn try_set(atomic: &AtomicU64, old: u64, new: u64) -> bool {
-        atomic
-            .compare_exchange(old, new, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
-            .is_ok()
-    }
-*/
 
 }
 
