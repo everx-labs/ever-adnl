@@ -5,9 +5,7 @@ use crate::{
         KeyId, KeyOption, KeyOptionJson, Query, serialize_inplace, Subscriber, TARGET, Timeouts
     }
 };
-use std::{
-    net::SocketAddr, sync::Arc
-};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use stream_cancel::StreamExt;
 use futures::prelude::*;
 use ton_api::ton::adnl::Message as AdnlMessage;
@@ -192,6 +190,8 @@ pub struct AdnlServer(stream_cancel::Trigger);
 
 impl AdnlServer {
 
+    const TIMEOUT_SHUTDOWN: u64 = 100; // Milliseconds
+
     /// Listen to connections
     pub async fn listen(
         config: AdnlServerConfig, 
@@ -233,9 +233,10 @@ impl AdnlServer {
         Ok(Self(trigger))
     }
 
-    /// Shutdown client
-    pub fn shutdown(self) {
+    /// Shutdown server
+    pub async fn shutdown(self) {
         drop(self.0);
+        tokio::time::delay_for(Duration::from_millis(Self::TIMEOUT_SHUTDOWN)).await;
     }
 
 }
