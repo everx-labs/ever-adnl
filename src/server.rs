@@ -212,10 +212,11 @@ impl AdnlServer {
 */
         subscribers.push(Arc::new(AdnlPingSubscriber));
         let subscribers = Arc::new(subscribers);
-        let mut listener = tokio::net::TcpListener::bind(config.address).await?;
+        let listener = tokio::net::TcpListener::bind(config.address).await?;
         tokio::spawn(
             async move {
-                let mut incoming = listener.incoming().take_until_if(tripwire);
+                let mut incoming = tokio_stream::wrappers::TcpListenerStream::new(listener)
+                    .take_until_if(tripwire);
                 loop {
                     match incoming.next().await {
                         Some(Err(e)) =>
@@ -236,7 +237,7 @@ impl AdnlServer {
     /// Shutdown server
     pub async fn shutdown(self) {
         drop(self.0);
-        tokio::time::delay_for(Duration::from_millis(Self::TIMEOUT_SHUTDOWN)).await;
+        tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_SHUTDOWN)).await;
     }
 
 }

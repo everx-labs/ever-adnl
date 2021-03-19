@@ -4,11 +4,11 @@ use ed25519::signature::{Signature, Verifier};
 use rand::Rng;
 use sha2::Digest;
 use std::{
-    fmt::{self, Debug, Display, Formatter}, hash::Hash, 
+    fmt::{self, Debug, Display, Formatter}, hash::Hash,
     sync::{Arc, atomic::{AtomicU64, AtomicUsize, Ordering}},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH}
 };
-use tokio::prelude::*;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ton_api::{
     BoxedSerialize, Deserializer, IntoBoxed, Serializer, 
     ton::{
@@ -284,7 +284,7 @@ impl Subscriber for AdnlPingSubscriber {
     }
 }
 
-/// ADNL TCP stream
+/// ADNL TCP stream                      
 pub struct AdnlStream(tokio_io_timeout::TimeoutStream<tokio::net::TcpStream>);
 
 impl AdnlStream {
@@ -298,17 +298,20 @@ impl AdnlStream {
     /// Read from stream
     pub async fn read(&mut self, buf: &mut Vec<u8>, len: usize) -> Result<()> {
         buf.resize(len, 0);
-        self.0.read_exact(&mut buf[..]).await?;
+        let Self(stream) = self;
+        stream.get_mut().read_exact(&mut buf[..]).await?;
         Ok(())
     }
     /// Shutdown stream
     pub async fn shutdown(&mut self) -> Result<()> {
-        self.0.shutdown().await?;
+        let Self(stream) = self;       
+        stream.get_mut().shutdown().await?;
         Ok(())
     }
     /// Write to stream
     pub async fn write(&mut self, buf: &mut Vec<u8>) -> Result<()> {
-        self.0.write_all(&buf[..]).await?;
+        let Self(stream) = self;
+        stream.get_mut().write_all(&buf[..]).await?;
         buf.truncate(0);
         Ok(())
     }
