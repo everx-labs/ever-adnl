@@ -1110,34 +1110,23 @@ impl AdnlNode {
         let mut queue_local_reader = node.queue_local_reader.pop().ok_or_else(
             || error!("ADNL node already started")
         )?;
-        let (mut receiver, mut sender) = {
-      	    let s = Socket::new(Domain::ipv4(), Type::dgram(), None)?;
-            s.set_send_buffer_size(1 << 24)?;
-            s.set_recv_buffer_size(1 << 24)?;
-            s.bind(
-                &SocketAddr::new(
-                    IpAddr::V4(Ipv4Addr::UNSPECIFIED), 
-                    node.config.ip_address.port()
-                ).into()
-            )?;
-            tokio::net::UdpSocket::from_std(s.into())?.split()
-/* 
-            tokio::net::UdpSocket::bind(
-                &SocketAddr::new(
-                    IpAddr::V4(Ipv4Addr::UNSPECIFIED), 
-                    node.config.ip_address.port()
-                )
-            )
-            .await?
-            .split();
-*/
-        };
+        let socket = Socket::new(Domain::ipv4(), Type::dgram(), None)?;
+        socket.set_send_buffer_size(1 << 24)?;
+        socket.set_recv_buffer_size(1 << 24)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(
+            &SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED), 
+                node.config.ip_address.port()
+            ).into()
+        )?;
+        let socket_send = Arc::new(tokio::net::UdpSocket::from_std(socket.into())?);
         let node_stop = node.clone();
         // Stopping watchdog
         tokio::spawn(
             async move {
                 loop {
-                    tokio::time::delay_for(Duration::from_millis(Self::TIMEOUT_QUERY_STOP)).await;
+                    tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_QUERY_STOP)).await;
                     if node_stop.stop.load(atomic::Ordering::Relaxed) > 0 {      
                         if let Err(e) = node_stop.queue_sender.send(Job::Stop) {
                             log::warn!(target: TARGET, "Cannot close node socket: {}", e);
@@ -1158,6 +1147,7 @@ impl AdnlNode {
         let subscribers_local = subscribers.clone();
         // Remote connections
         let node_recv = node.clone();
+        let socket_recv = socket_send.clone();
         tokio::spawn(
             async move {
                 let mut buf_source = None;
@@ -1169,7 +1159,7 @@ impl AdnlNode {
                             buf                                                       
                         }
                     );
-                    let res = receiver.recv_from(&mut buf[..]).await;
+                    let res = socket_recv.recv_from(&mut buf[..]).await;
                     if node_recv.stop.load(atomic::Ordering::Relaxed) > 0 {
                         break
                     }
@@ -1216,7 +1206,7 @@ impl AdnlNode {
                             true
                         )
                     };
-                    if let Err(e) = Self::send(&mut sender, job).await {
+                    if let Err(e) = Self::send(&socket_send, job).await {
                         log::warn!(target: TARGET, "ERROR --> {}", e);
                     }
                     if node_send.stop.load(atomic::Ordering::Relaxed) > 0 {
@@ -1282,12 +1272,12 @@ impl AdnlNode {
         log::warn!(target: TARGET, "Stopping ADNL node");
         self.stop.fetch_add(1, atomic::Ordering::Relaxed);
         loop {
-            tokio::time::delay_for(Duration::from_millis(Self::TIMEOUT_QUERY_STOP)).await;
+            tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_QUERY_STOP)).await;
             if self.stop.load(atomic::Ordering::Relaxed) >= 5 {
                 break
             }
         }
-        tokio::time::delay_for(Duration::from_millis(Self::TIMEOUT_SHUTDOWN)).await;
+        tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_SHUTDOWN)).await;
         log::warn!(target: TARGET, "ADNL node stopped");
     }
 
@@ -1297,8 +1287,7 @@ impl AdnlNode {
         add_object_to_map(
             &self.peers,
             ret.clone(),
-            || Ok(Arc::new(lockfree::map::Map::new())
-)
+            || Ok(Arc::new(lockfree::map::Map::new()))
         )?;
         Ok(ret)
     }
@@ -1455,7 +1444,7 @@ impl AdnlNode {
         let (query_id, msg) = Query::build(prefix, query)?;
         let (ping, query) = Query::new();
         self.queries.insert(query_id, query);
-log::warn!("Sent query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], query_id[2], query_id[3]);
+log::info!(target: TARGET, "Sent query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], query_id[2], query_id[3]);
         let channel = if peers.local() == peers.other() {       
             self.queue_local_sender.send((msg, peers.local().clone()))?;
             None
@@ -1468,16 +1457,20 @@ log::warn!("Sent query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], quer
         tokio::spawn(
             async move {
                 let timeout = timeout.unwrap_or(Self::TIMEOUT_QUERY_MAX);
-                tokio::time::delay_for(Duration::from_millis(timeout)).await;
+log::info!(target: TARGET, "Scheduling drop for query {:02x}{:02x}{:02x}{:02x} in {} ms", query_id[0], query_id[1], query_id[2], query_id[3], timeout);
+                tokio::time::sleep(Duration::from_millis(timeout)).await;
+log::info!(target: TARGET, "Try dropping query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], query_id[2], query_id[3]);
                 match Self::update_query(&queries, query_id, None).await {
-                    Err(e) => log::warn!(target: TARGET, "ERROR: {}", e),
+                    Err(e) => 
+log::info!(target: TARGET, "ERROR: {} when dropping query {:02x}{:02x}{:02x}{:02x}", e, query_id[0], query_id[1], query_id[2], query_id[3]),
                     Ok(true) => 
-log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], query_id[2], query_id[3]),
+log::info!(target: TARGET, "Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], query_id[2], query_id[3]),
                     _ => ()
                 }
             }
         );
         ping.wait().await;                     
+log::info!(target: TARGET, "Finished query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], query_id[2], query_id[3]);
         if let Some(removed) = self.queries.remove(&query_id) {
             match removed.val() {
                 Query::Received(answer) => 
@@ -1742,7 +1735,7 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
                     tokio::spawn(
                         async move {
                             loop {
-                                tokio::time::delay_for(
+                                tokio::time::sleep(
                                     Duration::from_millis(Self::TIMEOUT_TRANSFER * 100)
                                 ).await;
                                 if transfer_wait.updated.is_expired(Self::TIMEOUT_TRANSFER) {
@@ -1946,7 +1939,7 @@ log::warn!("Dropped query {:02x}{:02x}{:02x}{:02x}", query_id[0], query_id[1], q
         Ok(())
     }
 
-    async fn send(sender: &mut tokio::net::udp::SendHalf, job: SendJob) -> Result<()> {
+    async fn send(sender: &Arc<tokio::net::UdpSocket>, job: SendJob) -> Result<()> {
         let addr = SocketAddr::new(
             IpAddr::from(((job.destination >> 16) as u32).to_be_bytes()), 
             job.destination as u16
