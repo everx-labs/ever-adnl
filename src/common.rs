@@ -811,6 +811,9 @@ impl QueryResult {
 /// ADNL subscriber
 #[async_trait::async_trait]
 pub trait Subscriber: Send + Sync {
+    /// Poll (for periodic actions)
+    async fn poll(&self, _start: &Arc<Instant>) {
+    }
     /// Try consume custom data: data -> consumed yes/no
     async fn try_consume_custom(&self, _data: &[u8], _peers: &AdnlPeers) -> Result<bool> {
         Ok(false)
