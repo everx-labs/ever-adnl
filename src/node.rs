@@ -10,15 +10,13 @@ use crate::{
 use aes_ctr::stream_cipher::SyncStreamCipher;
 use rand::Rng;
 use sha2::Digest;
-use socket2::{Domain, Socket, Type};
+//use socket2::{Domain, Socket, Type};
 use std::{
     cmp::{min, Ordering}, fmt::{self, Debug, Display, Formatter}, 
     net::{IpAddr, Ipv4Addr, SocketAddr}, ops::Deref, 
     sync::{Arc, atomic::{self, AtomicI32, AtomicU32, AtomicU64, AtomicUsize}},
-    time::Duration
+    time::{Duration, Instant}
 };
-#[cfg(feature = "trace")]
-use std::time::Instant;
 use ton_api::{
     IntoBoxed, 
     ton::{
@@ -418,8 +416,9 @@ impl AdnlNodeAddress {
 /// ADNL node configuration
 pub struct AdnlNodeConfig {
     ip_address: IpAddress,
+    keys: lockfree::map::Map<Arc<KeyId>, Arc<KeyOption>>,
     tags: lockfree::map::Map<usize, Arc<KeyId>>,
-    keys: lockfree::map::Map<Arc<KeyId>, Arc<KeyOption>>
+    throughput: Option<u32>
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -431,7 +430,8 @@ struct AdnlNodeKeyJson {
 #[derive(serde::Deserialize, serde::Serialize)]
 pub struct AdnlNodeConfigJson {
     ip_address: String,
-    keys: Vec<AdnlNodeKeyJson>
+    keys: Vec<AdnlNodeKeyJson>,
+    throughput: Option<u32>
 }
 
 impl AdnlNodeConfigJson {
@@ -466,8 +466,9 @@ impl AdnlNodeConfig {
     ) -> Result<Self> {
         let ret = AdnlNodeConfig {
             ip_address: IpAddress::from_string(ip_address)?,
+            keys: lockfree::map::Map::new(),
             tags: lockfree::map::Map::new(),
-            keys: lockfree::map::Map::new()
+            throughput: None
         };
         for (key, tag) in keys {
             ret.add_key(key, tag)?;
@@ -495,7 +496,8 @@ impl AdnlNodeConfig {
         }
         let json = AdnlNodeConfigJson { 
             ip_address: ip_address.to_string(),
-            keys: json_keys
+            keys: json_keys,
+            throughput: None
         };
         Ok((json, Self::from_ip_address_and_keys(ip_address, tags_keys)?))
     } 
@@ -510,8 +512,9 @@ impl AdnlNodeConfig {
     pub fn from_json_config(json_config: &AdnlNodeConfigJson, as_src: bool) -> Result<Self> {
         let ret = AdnlNodeConfig {
             ip_address: json_config.ip_address()?,
+            keys: lockfree::map::Map::new(),
             tags: lockfree::map::Map::new(),
-            keys: lockfree::map::Map::new()
+            throughput: json_config.throughput
         };
         for key in json_config.keys.iter() {
             let data = if as_src {
@@ -545,7 +548,8 @@ impl AdnlNodeConfig {
         let ret = Self::from_ip_address_and_keys(ip_address, keys)?;
         let json = AdnlNodeConfigJson { 
             ip_address: ip_address.to_string(),
-            keys: jsons
+            keys: jsons,
+            throughput: None
         };
         Ok((json, ret))
     }    
@@ -576,6 +580,15 @@ impl AdnlNodeConfig {
     /// Set port number
     pub fn set_port(&mut self, port: u16) {
         self.ip_address.set_port(port)
+    }
+
+    /// Set throughput (packets / ms)
+    pub fn set_throughput(&mut self, throughput: Option<u32>) {
+        self.throughput = if let Some(0) = &throughput {
+            None
+        } else {
+            throughput
+        }
     }
 
     fn add_key(&self, key: KeyOption, tag: usize) -> Result<Arc<KeyId>> {
@@ -699,7 +712,7 @@ struct Peer {
     send_state: PeerState
 }
 
-#[cfg(feature = "trace")]
+#[cfg(feature = "telemetry")]
 impl Peer {
 
     fn update_recv_stats(&self, bytes: u64) {
@@ -923,13 +936,13 @@ log::warn!(target: target, "ADNL6");
 struct PeerState {
     history: PeerHistory,
     reinit_date: AtomicI32,
-    #[cfg(feature = "trace")]
+    #[cfg(feature = "telemetry")]
     start: Instant,
-    #[cfg(feature = "trace")]
+    #[cfg(feature = "telemetry")]
     print: AtomicU64,
-    #[cfg(feature = "trace")]
+    #[cfg(feature = "telemetry")]
     bytes: AtomicU64,
-    #[cfg(feature = "trace")]
+    #[cfg(feature = "telemetry")]
     packets: AtomicU64
 }
 
@@ -939,13 +952,13 @@ impl PeerState {
         Self {
             history: PeerHistory::new(),
             reinit_date: AtomicI32::new(reinit_date),
-            #[cfg(feature = "trace")]
+            #[cfg(feature = "telemetry")]
             start: Instant::now(),
-            #[cfg(feature = "trace")]
+            #[cfg(feature = "telemetry")]
             print: AtomicU64::new(0),
-            #[cfg(feature = "trace")]
+            #[cfg(feature = "telemetry")]
             bytes: AtomicU64::new(0),
-            #[cfg(feature = "trace")]
+            #[cfg(feature = "telemetry")]
             packets: AtomicU64::new(0)
         }
     }
@@ -954,13 +967,13 @@ impl PeerState {
         Self {
             history: PeerHistory::new(),
             reinit_date: AtomicI32::new(0),
-            #[cfg(feature = "trace")]
+            #[cfg(feature = "telemetry")]
             start: Instant::now(),
-            #[cfg(feature = "trace")]
+            #[cfg(feature = "telemetry")]
             print: AtomicU64::new(0),
-            #[cfg(feature = "trace")]
+            #[cfg(feature = "telemetry")]
             bytes: AtomicU64::new(0),
-            #[cfg(feature = "trace")]
+            #[cfg(feature = "telemetry")]
             packets: AtomicU64::new(0)
         }
     }
@@ -984,7 +997,7 @@ impl PeerState {
         self.history.update(seqno, TARGET).await
     }
 
-    #[cfg(feature = "trace")]
+    #[cfg(feature = "telemetry")]
     fn update_stats(&self, bytes: u64) -> bool {
         self.bytes.fetch_add(bytes, atomic::Ordering::Relaxed);
         self.packets.fetch_add(1, atomic::Ordering::Relaxed);
@@ -1020,8 +1033,6 @@ type TransferId = [u8; 32];
 
 /// ADNL node
 pub struct AdnlNode {
-    #[cfg(feature = "trace")]
-    answers: lockfree::map::Map<QueryId, Vec<u8>>,
     config: AdnlNodeConfig,
     channels_recv: Arc<ChannelsRecv>,
     channels_send: Arc<ChannelsSend>,
@@ -1035,7 +1046,7 @@ pub struct AdnlNode {
         tokio::sync::mpsc::UnboundedReceiver<(AdnlMessage, Arc<KeyId>)>
     >,
     start_time: i32,
-    stop: AtomicU32,
+    stop: Arc<AtomicU32>,
     transfers: Arc<lockfree::map::Map<TransferId, Arc<Transfer>>>
 }
 
@@ -1045,7 +1056,7 @@ impl AdnlNode {
     const MAX_ADNL_MESSAGE: usize = 1024;
     const SIZE_BUFFER: usize = 2048;
     const TIMEOUT_ADDRESS: i32 = 1000;       // Seconds
-    const TIMEOUT_CHANNEL_RESET: u32 = 5000; // Milliseconds
+    const TIMEOUT_CHANNEL_RESET: u32 = 30;   // Seconds
     const TIMEOUT_QUERY_MIN: u64 = 500;      // Milliseconds
     const TIMEOUT_QUERY_MAX: u64 = 5000;     // Milliseconds
     const TIMEOUT_QUERY_STOP: u64 = 1;       // Milliseconds
@@ -1078,8 +1089,6 @@ impl AdnlNode {
         let (queue_local_sender, queue_local_reader) = tokio::sync::mpsc::unbounded_channel();
         let incinerator = lockfree::map::SharedIncin::new();
         let ret = Self {
-            #[cfg(feature = "trace")]
-            answers: lockfree::map::Map::new(),
             config, 
             channels_recv: Arc::new(lockfree::map::Map::new()), 
             channels_send: Arc::new(lockfree::map::Map::with_incin(incinerator.clone())), 
@@ -1091,7 +1100,7 @@ impl AdnlNode {
             queue_local_sender,
             queue_local_reader: lockfree::queue::Queue::new(),
             start_time: Version::get(),
-            stop: AtomicU32::new(0),
+            stop: Arc::new(AtomicU32::new(0)),
             transfers: Arc::new(lockfree::map::Map::new())
         };
         ret.queue_reader.push(queue_reader);
@@ -1110,19 +1119,47 @@ impl AdnlNode {
         let mut queue_local_reader = node.queue_local_reader.pop().ok_or_else(
             || error!("ADNL node already started")
         )?;
-        let socket = Socket::new(Domain::ipv4(), Type::dgram(), None)?;
-        socket.set_send_buffer_size(1 << 24)?;
-        socket.set_recv_buffer_size(1 << 24)?;
-        socket.set_nonblocking(true)?;
-        socket.bind(
+//        let socket = Socket::new(Domain::ipv4(), Type::dgram(), None)?;
+//        socket.set_send_buffer_size(2048/*1 << 26*/)?;
+//        socket.set_recv_buffer_size(1 << 26)?;
+//        socket.set_nonblocking(true)?;
+//        socket.bind(
+//            &SocketAddr::new(
+//                IpAddr::V4(Ipv4Addr::UNSPECIFIED), 
+//                node.config.ip_address.port()
+//            ).into()
+//        )?;
+//        let socket_send = Arc::new(tokio::net::UdpSocket::from_std(socket.into())?);
+        let socket_send = tokio::net::UdpSocket::bind(
             &SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::UNSPECIFIED), 
                 node.config.ip_address.port()
-            ).into()
-        )?;
-        let socket_send = Arc::new(tokio::net::UdpSocket::from_std(socket.into())?);
-        let node_stop = node.clone();
+            )
+        ).await?;
+        let socket_send = Arc::new(socket_send);
+        subscribers.push(Arc::new(AdnlPingSubscriber));
+        // Subscribers poll
+        let start = Arc::new(Instant::now());
+        let subscribers = Arc::new(subscribers);
+        let subscribers_local = subscribers.clone();
+        for subscriber in subscribers.iter() {
+            let node_subs = node.clone();
+            let start = start.clone();
+            let subscriber = subscriber.clone();
+            tokio::spawn(
+                async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_QUERY_STOP)).await;
+                        if node_subs.stop.load(atomic::Ordering::Relaxed) > 0 {      
+                            break
+                        }  
+                        subscriber.poll(&start).await;
+                    }
+                }
+            );
+        }
         // Stopping watchdog
+        let node_stop = node.clone();
         tokio::spawn(
             async move {
                 loop {
@@ -1142,9 +1179,6 @@ impl AdnlNode {
                 log::warn!(target: TARGET, "Node stopping watchdog exited");
             }
         );
-        subscribers.push(Arc::new(AdnlPingSubscriber));
-        let subscribers = Arc::new(subscribers);
-        let subscribers_local = subscribers.clone();
         // Remote connections
         let node_recv = node.clone();
         let socket_recv = socket_send.clone();
@@ -1193,6 +1227,8 @@ impl AdnlNode {
         let node_send = node.clone();
         tokio::spawn(
             async move {
+                let start = Instant::now();
+                let mut last = 0;
                 while let Some(job) = queue_reader.recv().await {
                     let (job, stop) = match job {
                         Job::Send(job) => (job, false),
@@ -1206,9 +1242,22 @@ impl AdnlNode {
                             true
                         )
                     };
-                    if let Err(e) = Self::send(&socket_send, job).await {
-                        log::warn!(target: TARGET, "ERROR --> {}", e);
+                    if let Some(throughput) = &node_send.config.throughput {
+                        let latency = if *throughput > 0 {
+                            1000 / *throughput
+                        } else {
+                            0
+                        } as u128;
+                        if latency > 0 {
+                            while start.elapsed().as_micros() - last < latency {
+                                tokio::task::yield_now().await
+                            }
+                        }
                     }
+                    if let Err(e) = Self::send(&socket_send, job).await {
+                        log::error!(target: TARGET, "ERROR --> {}", e);
+                    }
+                    last = start.elapsed().as_micros();
                     if node_send.stop.load(atomic::Ordering::Relaxed) > 0 {
                         if stop {
                             break
@@ -1708,9 +1757,7 @@ log::info!(target: TARGET, "Finished query {:02x}{:02x}{:02x}{:02x}", query_id[0
         &self,
         subscribers: &Vec<Arc<dyn Subscriber>>,
         msg: &AdnlMessage,
-        peers: &AdnlPeers,
-        #[cfg(feature = "trace")]
-        data: Vec<u8>
+        peers: &AdnlPeers
     ) -> Result<()> {
         let new_msg = if let AdnlMessage::Adnl_Message_Part(part) = msg {
             let transfer_id = get256(&part.hash);
@@ -1775,22 +1822,6 @@ log::info!(target: TARGET, "Finished query {:02x}{:02x}{:02x}{:02x}", query_id[0
         };
         let msg = match new_msg.as_ref().unwrap_or(msg) {
             AdnlMessage::Adnl_Message_Answer(answer) => {
-                #[cfg(feature = "trace")] {    
-                    let query_id = get256(&answer.query_id).clone();
-                    if !add_object_to_map(
-                        &self.answers, 
-                        query_id.clone(), 
-                        || Ok(data.clone())
-                    )? {
-                        fail!(
-                            "INTERNAL ERROR: duplicated answer ({}) {:?} {:?} {:?}",
-                            answer.answer.0.len(), 
-                            query_id,
-                            self.answers.get(&query_id),
-                            data
-                        )
-                    }
-                }
                 self.process_answer(answer, peers.other()).await?;
                 None
             },
@@ -1872,8 +1903,8 @@ log::info!(target: TARGET, "Finished query {:02x}{:02x}{:02x}{:02x}", query_id[0
         buf: &mut Vec<u8>,
         subscribers: &Vec<Arc<dyn Subscriber>>,
     ) -> Result<()> {
-        #[cfg(feature = "trace")]
-        let trace_buf = buf.clone();
+        #[cfg(feature = "telemetry")]
+        let received_len = buf.len();
         let (local_key, other_key) = if let Some(local_key) = AdnlHandshake::parse_packet(
             &self.config.keys, 
             buf, 
@@ -1908,27 +1939,23 @@ log::info!(target: TARGET, "Finished query {:02x}{:02x}{:02x}{:02x}", query_id[0
         } else {
             return Ok(())
         };
-        #[cfg(feature = "trace")]
+        #[cfg(feature = "telemetry")]
         if let Some(peer) = self.peers(&local_key)?.get(&other_key) {
-            peer.val().update_recv_stats(trace_buf.len() as u64)
+            peer.val().update_recv_stats(received_len as u64)
         }
         let peers = AdnlPeers::with_keys(local_key, other_key);
         if let Some(msg) = pkt.message() { 
             self.process(
                 subscribers, 
                 msg, 
-                &peers, 
-                #[cfg(feature = "trace")]
-                trace_buf
+                &peers 
             ).await?
         } else if let Some(msgs) = pkt.messages() {
             for msg in msgs.deref() {
                 self.process(
                     subscribers, 
                     msg, 
-                    &peers, 
-                    #[cfg(feature = "trace")]
-                    trace_buf.clone()
+                    &peers
                 ).await?;
             }
         } else {
@@ -2076,7 +2103,7 @@ log::info!(target: TARGET, "Finished query {:02x}{:02x}{:02x}{:02x}", query_id[0
             let (_, key) = KeyOption::with_type_id(source.type_id())?;
             AdnlHandshake::build_packet(&mut data, &key, &peer.address.key)?;
         }
-        #[cfg(feature = "trace")]
+        #[cfg(feature = "telemetry")]
         peer.update_send_stats(data.len() as u64);
         let job = SendJob { 
             destination: peer.address.ip_address.load(atomic::Ordering::Relaxed),

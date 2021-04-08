@@ -40,6 +40,6 @@ log4rs = "0.8.3"
 [features]
 client = []
 server = []
-node   = ["external-ip"]
-trace  = []
+node = ["external-ip"]
+telemetry = []
 
