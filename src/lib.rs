@@ -5,5 +5,5 @@ pub mod client;
 pub mod server;
 #[cfg(feature = "node")]
 pub mod node;
-
+pub mod telemetry;
 
