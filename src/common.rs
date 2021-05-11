@@ -1,4 +1,4 @@
-use aes_ctr::stream_cipher::{NewStreamCipher, SyncStreamCipher};
+use aes_ctr::cipher::stream::{NewStreamCipher, SyncStreamCipher};
 use core::ops::Range;
 use ed25519::signature::{Signature, Verifier};
 use rand::Rng;
@@ -141,8 +141,8 @@ impl AdnlCryptoUtils {
     
     fn build_cipher_internal(key: &[u8], ctr: &[u8]) -> aes_ctr::Aes256Ctr {
         aes_ctr::Aes256Ctr::new(
-            aes_ctr::stream_cipher::generic_array::GenericArray::from_slice(key), 
-            aes_ctr::stream_cipher::generic_array::GenericArray::from_slice(ctr) 
+            aes_ctr::cipher::generic_array::GenericArray::from_slice(key), 
+            aes_ctr::cipher::generic_array::GenericArray::from_slice(ctr) 
         )
     }
 
