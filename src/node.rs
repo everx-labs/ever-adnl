@@ -9,7 +9,7 @@ use crate::{
 };
 #[cfg(feature = "telemetry")]
 use crate::telemetry::{Metric, MetricBuilder, TelemetryItem, TelemetryPrinter};
-use aes_ctr::stream_cipher::SyncStreamCipher;
+use aes_ctr::cipher::stream::SyncStreamCipher;
 use rand::Rng;
 use sha2::Digest;
 use socket2::{Domain, SockAddr, Socket, Type};
