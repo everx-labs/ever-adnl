@@ -178,7 +178,6 @@ impl AdnlHandshake {
             local.pvt_key()?, 
             other.pub_key()?
         );
-        dump!(trace, TARGET, "Shared Secret", &shared_secret);
         Self::build_packet_cipher(&mut shared_secret, &checksum)
             .apply_keystream(&mut buf[96..]);
         Ok(())
@@ -201,7 +200,6 @@ impl AdnlHandshake {
                     key.val().pvt_key()?, 
                     arrayref::array_ref!(buf, 32, 32)
                 );
-                dump!(trace, TARGET, "Shared Secret", &shared_secret);
                 let range = if let Some(len) = len {
                     96..96 + len
                 } else {
@@ -228,8 +226,6 @@ impl AdnlHandshake {
         let y = &checksum[..];
         let mut aes_key_bytes = from_slice!(x, 0, 16, y, 16, 16);
         let mut aes_ctr_bytes = from_slice!(y, 0,  4, x, 20, 12);
-        dump!(trace, TARGET, "AES-Ctr Key (handshake)", &aes_key_bytes);
-        dump!(trace, TARGET, "AES-Ctr Counter (handshake)", &aes_ctr_bytes);
         shared_secret.iter_mut().for_each(|a| *a = 0);
         AdnlCryptoUtils::build_cipher_secure(&mut aes_key_bytes, &mut aes_ctr_bytes)
     }
