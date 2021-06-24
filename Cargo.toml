@@ -2,7 +2,7 @@
 edition = "2018"
 build = "./common/build/build.rs"
 name = "adnl"
-version = "0.2.10"
+version = "0.2.48"
 description = "ADNL library"
 
 [dependencies]
