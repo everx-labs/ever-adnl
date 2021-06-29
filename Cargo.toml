@@ -2,8 +2,10 @@
 edition = "2018"
 build = "./common/build/build.rs"
 name = "adnl"
-version = "0.2.48"
+version = "0.5.5"
 description = "ADNL library"
+
+[workspace]
 
 [dependencies]
 aes-ctr = "0.6.0"
@@ -27,6 +29,7 @@ tokio = { version = "1.5.0", features = ["io-util", "macros", "net", "rt-multi-t
 tokio-io-timeout = "1.1.1"
 tokio-stream = { version = "0.1.4", features = ["net"] }
 x25519-dalek = "0.6.0"
+zstd = { version  = "0.8", optional = true, features = ["pkg-config"] }
 
 ton_api = { git = "https://github.com/tonlabs/ton-labs-tl.git", package = "ton_api" }
 ton_types = { git = "https://github.com/tonlabs/ton-labs-types.git" }
@@ -41,5 +44,6 @@ log4rs = "0.8.3"
 client = []
 server = []
 node = ["external-ip"]
+compression = ["zstd"]
 telemetry = []
 
