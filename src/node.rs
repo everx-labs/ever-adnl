@@ -19,6 +19,8 @@ use std::{
     sync::{Arc, atomic::{self, AtomicI32, AtomicU32, AtomicU64, AtomicUsize}},
     time::{Duration, Instant}, thread
 };
+#[cfg(feature = "compression")]
+use std::io::Cursor;
 use ton_api::{
     IntoBoxed, 
     ton::{
@@ -684,6 +686,49 @@ impl AdnlNodeConfig {
 
 }
 
+#[cfg(feature = "compression")] 
+pub struct DataCompression;
+
+#[cfg(feature = "compression")] 
+impl DataCompression {
+
+    const COMPRESSION_LEVEL: i32 = 0;
+    const SIZE_COMPRESSION_THRESHOLD: usize = 256;
+    const TAG_COMPRESSED: u8 = 0x80;
+    const TAG_UNCOMPRESSED: u8 = 0x00;
+ 
+    pub fn compress(data: &[u8]) -> Result<Vec<u8>> {
+        let uncompressed = data.len();
+        if uncompressed <= Self::SIZE_COMPRESSION_THRESHOLD {
+            let mut ret = Vec::with_capacity(data.len() + 1);
+            ret.extend_from_slice(data);  
+            ret.push(Self::TAG_UNCOMPRESSED);
+            Ok(ret)
+        } else {
+            let mut ret = zstd::stream::encode_all(Cursor::new(data), Self::COMPRESSION_LEVEL)?;
+            let compressed = ret.len();
+            log::info!(target: TARGET, "Compression: {} -> {}", uncompressed, compressed);
+            ret.push(Self::TAG_COMPRESSED);
+            Ok(ret)
+        }
+    } 
+
+    pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
+        let len = data.len();
+        if len == 0 {
+            fail!("Too short input data for decompression")
+        }
+        match data[len - 1] {
+            Self::TAG_COMPRESSED => 
+                Ok(zstd::stream::decode_all(Cursor::new(&data[..len - 1]))?),
+            Self::TAG_UNCOMPRESSED => 
+                Ok(data[..len - 1].to_vec()),
+            x => fail!("Bad compression tag {:x}", x) 
+        }
+    }
+
+}
+
 /// IP address internal representation
 #[derive(PartialEq)]
 pub struct IpAddress(u64);
@@ -1246,7 +1291,14 @@ impl Debug for SendData {
 
 impl Drop for SendData {
     fn drop(&mut self) {
-        self.queue.count.fetch_sub(1, atomic::Ordering::Relaxed);
+        let count = self.queue.count.fetch_sub(1, atomic::Ordering::Relaxed);
+if count - 1 > 1000000 {
+log::warn!(
+    target: "telemetry", 
+    "Update MAX in send queue, count was dropped to {}", 
+    count
+)
+}
     }
 }
 
@@ -1281,7 +1333,14 @@ impl SendQueue {
 
     fn put(&self, job: SendJob) -> Result<()> {
         self.sender.send(job)?;
-        self.count.fetch_add(1, atomic::Ordering::Relaxed);
+        let count = self.count.fetch_add(1, atomic::Ordering::Relaxed);
+if count + 1 > 1000000 {
+log::warn!(
+    target: "telemetry", 
+    "Update MAX in send queue, count will be {}", 
+    count
+)
+}
         Ok(())
     }
 
@@ -1292,7 +1351,15 @@ impl SendQueue {
         let ret = receiver.recv().await;
         #[cfg(feature = "telemetry")] 
         if let Some(SendJob::Data(_)) = &ret {
-            self.metric.update(self.count.load(atomic::Ordering::Relaxed))
+            let count = self.count.load(atomic::Ordering::Relaxed);
+if count > 1000000 {
+log::warn!(
+    target: "telemetry", 
+    "Update MAX in send queue, count is {}", 
+    count
+)
+}
+            self.metric.update(count)
         }
         ret
     }
