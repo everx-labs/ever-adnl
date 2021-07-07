@@ -168,13 +168,6 @@ impl Metric {
         loop {
             let maximum = self.maximum.load(Ordering::Relaxed);
             if maximum < update {
-log::warn!(
-    target: TARGET_TELEMETRY, 
-    "Update MAX in {}: {} -> {}", 
-    self.name(),
-    maximum,
-    update
-);
                 if self.maximum.compare_exchange(
                     maximum, 
                     update,  
