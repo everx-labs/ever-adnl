@@ -2,7 +2,7 @@
 edition = "2018"
 build = "./common/build/build.rs"
 name = "adnl"
-version = "0.7.45"
+version = "0.7.46"
 description = "ADNL library"
 
 [workspace]

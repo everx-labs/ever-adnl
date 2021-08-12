@@ -10,7 +10,7 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ton_api::{
-    BoxedSerialize, Deserializer, IntoBoxed, Serializer, 
+    BoxedSerialize, ConstructorNumber, Deserializer, IntoBoxed, Serializer, 
     ton::{
         self, TLObject, 
         adnl::{
@@ -274,7 +274,13 @@ impl Subscriber for AdnlPingSubscriber {
         _peers: &AdnlPeers
     ) -> Result<QueryResult> {
         match object.downcast::<AdnlPing>() {
-            Ok(ping) => QueryResult::consume(AdnlPong { value: ping.value }),
+            Ok(ping) => QueryResult::consume(
+                AdnlPong { 
+                    value: ping.value 
+                }, 
+                #[cfg(feature = "telemetry")]
+                None
+            ),
             Err(object) => Ok(QueryResult::Rejected(object))
         }
     }
@@ -380,8 +386,8 @@ impl AdnlStreamCrypto {
 
 /// ADNL/RLDP answer
 pub enum Answer {
-    Object(TLObject),
-    Raw(Vec<u8>)
+    Object(TaggedTlObject),
+    Raw(TaggedByteVec)
 }
 
 /// ADNL key ID (node ID)
@@ -648,20 +654,27 @@ impl Query {
     }
 
     /// Build query
-    pub fn build(prefix: Option<&[u8]>, query: &TLObject) -> Result<(QueryId, AdnlMessage)> {
+    pub fn build(
+        prefix: Option<&[u8]>, 
+        query_body: &TaggedTlObject
+    ) -> Result<(QueryId, TaggedAdnlMessage)> {
         let query_id: QueryId = rand::thread_rng().gen();
         let query = if let Some(prefix) = prefix {
             let mut prefix = prefix.to_vec();
-            serialize_append(&mut prefix, query)?;
+            serialize_append(&mut prefix, &query_body.object)?;
             prefix
         } else {
-            serialize(query)?
+            serialize(&query_body.object)?
         };
-        let message = AdnlQueryMessage {
-            query_id: ton::int256(query_id.clone()),
-            query: ton::bytes(query)
-        }.into_boxed();
-        Ok((query_id, message))
+        let msg = TaggedAdnlMessage {
+            object: AdnlQueryMessage {
+                query_id: ton::int256(query_id.clone()),
+                query: ton::bytes(query)
+            }.into_boxed(),
+            #[cfg(feature = "telemetry")]
+            tag: query_body.tag
+        };
+        Ok((query_id, msg))
     }
 
     /// Parse answer
@@ -681,14 +694,18 @@ impl Query {
         subscribers: &Vec<Arc<dyn Subscriber>>,
         query: &AdnlQueryMessage,
         peers: &AdnlPeers                                                                    
-    ) -> Result<(bool, Option<AdnlMessage>)> {
+    ) -> Result<(bool, Option<TaggedAdnlMessage>)> {
         if let (true, answer) = Self::process(subscribers, &query.query[..], peers).await? {
             Self::answer(
                 answer,
-                |answer| AdnlAnswerMessage {
-                    query_id: query.query_id.clone(),  
-                    answer: ton::bytes(answer)
-                }.into_boxed()
+                |answer| TaggedAdnlMessage {
+                    object: AdnlAnswerMessage {
+                        query_id: query.query_id.clone(),  
+                        answer: ton::bytes(answer.object)
+                    }.into_boxed(),
+                    #[cfg(feature = "telemetry")]
+                    tag: answer.tag
+                }
             )
         } else {
             Ok((false, None))
@@ -714,13 +731,17 @@ impl Query {
         subscribers: &Vec<Arc<dyn Subscriber>>,
         query: &RldpQuery,                                                               
         peers: &AdnlPeers     
-    ) -> Result<(bool, Option<RldpAnswer>)> {
+    ) -> Result<(bool, Option<TaggedRldpAnswer>)> {
         if let (true, answer) = Self::process(subscribers, &query.data[..], peers).await? {
             Self::answer(
                 answer, 
-                |answer| RldpAnswer {
-                    query_id: query.query_id.clone(),  
-                    data: ton::bytes(answer)
+                |answer| TaggedRldpAnswer {
+                    object: RldpAnswer {
+                        query_id: query.query_id.clone(),  
+                        data: ton::bytes(answer.object)
+                    },
+                    #[cfg(feature = "telemetry")]
+                    tag: answer.tag          
                 }
             )
         } else {
@@ -730,10 +751,16 @@ impl Query {
 
     fn answer<A>(
         answer: Option<Answer>,
-        convert: impl Fn(Vec<u8>) -> A
+        convert: impl Fn(TaggedByteVec) -> A
     ) -> Result<(bool, Option<A>)> {
         let answer = match answer {
-            Some(Answer::Object(x)) => Some(serialize(&x)?),
+            Some(Answer::Object(x)) => Some(
+                TaggedByteVec {
+                    object: serialize(&x.object)?,
+                    #[cfg(feature = "telemetry")]
+                    tag: x.tag
+                }
+            ),
             Some(Answer::Raw(x)) => Some(x),
             None => None
         };
@@ -789,17 +816,42 @@ pub enum QueryResult {
 impl QueryResult {                        
 
     /// Consume plain helper
-    pub fn consume<A: IntoBoxed>(answer: A) -> Result<Self> 
+    pub fn consume<A: IntoBoxed>(
+        answer: A, 
+        #[cfg(feature = "telemetry")]
+        tag: Option<u32>
+    ) -> Result<Self> 
         where <A as IntoBoxed>::Boxed: Send + Sync + serde::Serialize + 'static 
     {
-        Ok(QueryResult::Consumed(Some(Answer::Object(TLObject::new(answer.into_boxed())))))
+        QueryResult::consume_boxed(
+            answer.into_boxed(),
+            #[cfg(feature = "telemetry")]
+            tag
+        )
     }
 
     /// Consume boxed helper
-    pub fn consume_boxed<A>(answer: A) -> Result<Self> 
+    pub fn consume_boxed<A>(
+        answer: A,
+        #[cfg(feature = "telemetry")]
+        tag: Option<u32>
+    ) -> Result<Self> 
         where A: BoxedSerialize + Send + Sync + serde::Serialize + 'static
     {
-        Ok(QueryResult::Consumed(Some(Answer::Object(TLObject::new(answer)))))
+        let object = TLObject::new(answer);
+        #[cfg(feature = "telemetry")]
+        let tag = tag.unwrap_or_else(
+            || {
+                let (ConstructorNumber(tag), _) = object.serialize_boxed();
+                tag
+            }
+        );
+        let ret = TaggedTlObject {
+            object,
+            #[cfg(feature = "telemetry")]
+            tag
+        };
+        Ok(QueryResult::Consumed(Some(Answer::Object(ret))))
     }
 
 }
@@ -831,6 +883,18 @@ pub trait Subscriber: Send + Sync {
         Ok(QueryResult::RejectedBundle(objects))
     }
 }
+
+/// Tagged objects 
+pub struct TaggedObject<T> {
+    pub object: T,
+    #[cfg(feature = "telemetry")]
+    pub tag: u32 
+}
+pub type TaggedAdnlMessage = TaggedObject<AdnlMessage>;
+pub type TaggedByteSlice<'a> = TaggedObject<&'a[u8]>;
+pub type TaggedByteVec = TaggedObject<Vec<u8>>;
+pub type TaggedTlObject = TaggedObject<TLObject>;
+pub type TaggedRldpAnswer = TaggedObject<RldpAnswer>;
 
 /// Network timeouts
 #[derive(Clone, serde::Deserialize, serde::Serialize)]
@@ -1065,3 +1129,23 @@ pub fn serialize_inplace<T: BoxedSerialize>(buf: &mut Vec<u8>, object: &T) -> Re
     buf.truncate(0); 
     serialize_append(buf, object)
 }
+
+/// Get TL tag from boxed type
+pub fn tag_from_boxed_type<T: Default + BoxedSerialize>() -> u32 {
+    let (ConstructorNumber(tag), _) = T::default().serialize_boxed();
+    tag
+}
+
+/// Get TL tag from object
+pub fn tag_from_object<T: BoxedSerialize>(object: &T) -> u32 {
+    let (ConstructorNumber(tag), _) = object.serialize_boxed();
+    tag
+}
+
+/// Get TL tag from unboxed type
+pub fn tag_from_unboxed_type<T: Default + IntoBoxed>() -> u32 {
+    let (ConstructorNumber(tag), _) = T::default().into_boxed().serialize_boxed();
+    tag
+}
+
+

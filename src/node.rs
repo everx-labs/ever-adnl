@@ -3,8 +3,8 @@ use crate::{
     common::{
         add_object_to_map, add_object_to_map_with_update, AdnlCryptoUtils, AdnlHandshake, 
         AdnlPeers, AdnlPingSubscriber, deserialize, get256, hash, KeyId, KeyOption, 
-        KeyOptionJson, Query, QueryCache, QueryId, serialize, Subscriber, TARGET, UpdatedAt, 
-        Version
+        KeyOptionJson, Query, QueryCache, QueryId, serialize, Subscriber, TARGET, 
+        TaggedAdnlMessage, TaggedByteSlice, TaggedTlObject, UpdatedAt, Version
     }
 };
 #[cfg(feature = "telemetry")]
@@ -1155,7 +1155,7 @@ impl PeerState {
             #[cfg(feature = "telemetry")]
             bytes: AtomicU64::new(0),
             #[cfg(feature = "telemetry")]
-            packets: Self::add_metric(node, peers, "packets/ms", false)
+            packets: Self::add_metric(node, peers, "packets/sec", false)
         }
     }
 
@@ -1178,7 +1178,7 @@ impl PeerState {
             #[cfg(feature = "telemetry")]
             bytes: AtomicU64::new(0),
             #[cfg(feature = "telemetry")]
-            packets: Self::add_metric(node, peers, "packets/ms", true)
+            packets: Self::add_metric(node, peers, "packets/sec", true)
         }
     }
 
@@ -1223,7 +1223,8 @@ impl PeerState {
     fn add_metric(
         node: &AdnlNode, 
         peers: &AdnlPeers, 
-        tag: &str, send: bool
+        tag: &str, 
+        send: bool
     ) -> Arc<MetricBuilder> {
         let local = peers.local().to_string();
         let other = peers.other().to_string();
@@ -1582,10 +1583,6 @@ impl SendPipeline {
 
 }
 
-enum SendReader {
-    Loopback(tokio::sync::mpsc::UnboundedReceiver<(AdnlMessage, Arc<KeyId>)>)
-}
-
 #[derive(Clone)]
 enum Subchannel {
     None,
@@ -1617,6 +1614,7 @@ struct Telemetry {
     recv_tmp2: Arc<Metric>,
     recv_tmp3: Arc<Metric>,
     send_ordinary_packets: Arc<Metric>,
+    send_ordinary_tags: lockfree::map::Map<u32, Arc<MetricBuilder>>,
     send_priority_packets: Arc<Metric>,
     send_sock: Arc<MetricBuilder>,
     printer: TelemetryPrinter
@@ -1640,6 +1638,9 @@ impl Telemetry {
     }
 }
 
+type LoopbackReader = tokio::sync::mpsc::UnboundedReceiver<(AdnlMessage, Arc<KeyId>)>;
+type LoopbackSender = tokio::sync::mpsc::UnboundedSender<(AdnlMessage, Arc<KeyId>)>;
+
 /// ADNL node
 pub struct AdnlNode {
     channels_recv: Arc<ChannelsRecv>,
@@ -1649,8 +1650,8 @@ pub struct AdnlNode {
     peers: lockfree::map::Map<Arc<KeyId>, Arc<Peers>>,
     queries: Arc<QueryCache>, 
     queue_monitor_queries: lockfree::queue::Queue<(u64, QueryId)>,
-    queue_send_loopback_packets: tokio::sync::mpsc::UnboundedSender<(AdnlMessage, Arc<KeyId>)>,
-    queue_send_readers: lockfree::queue::Queue<SendReader>,
+    queue_send_loopback_packets: LoopbackSender,
+    queue_send_loopback_readers: lockfree::queue::Queue<LoopbackReader>,
     send_pipeline: SendPipeline,
     start_time: i32,
     stop: Arc<AtomicU32>,
@@ -1737,6 +1738,7 @@ impl AdnlNode {
                 recv_tmp2,
                 recv_tmp3,
                 send_ordinary_packets,
+                send_ordinary_tags: lockfree::map::Map::new(), 
                 send_priority_packets,
                 send_sock,
                 printer
@@ -1751,7 +1753,7 @@ impl AdnlNode {
             queries: Arc::new(lockfree::map::Map::new()), 
             queue_monitor_queries: lockfree::queue::Queue::new(),
             queue_send_loopback_packets: queue_send_loopback_sender,
-            queue_send_readers: lockfree::queue::Queue::new(),
+            queue_send_loopback_readers: lockfree::queue::Queue::new(),
             send_pipeline: SendPipeline::new(
                 #[cfg(feature = "telemetry")]
                 telemetry.send_ordinary_packets.clone(),
@@ -1764,7 +1766,7 @@ impl AdnlNode {
             #[cfg(feature = "telemetry")]
             telemetry
         };
-        ret.queue_send_readers.push(SendReader::Loopback(queue_send_loopback_reader));
+        ret.queue_send_loopback_readers.push(queue_send_loopback_reader);
         Ok(Arc::new(ret))
     }
 
@@ -1781,8 +1783,8 @@ impl AdnlNode {
     ) -> Result<()> {
         let mut queue_send_loopback_reader = None;
         for _ in 0..1 {
-            match node.queue_send_readers.pop() {
-                Some(SendReader::Loopback(reader)) => queue_send_loopback_reader = Some(reader),
+            match node.queue_send_loopback_readers.pop() {
+                Some(reader) => queue_send_loopback_reader = Some(reader),
                 _ => fail!("ADNL node already started")
             }
         }
@@ -1851,7 +1853,7 @@ impl AdnlNode {
                     if node_stop.stop.load(atomic::Ordering::Relaxed) > 0 {      
                         node_stop.send_pipeline.shutdown();
                         let stop = (
-                            AdnlMessage::Adnl_Message_Nop, 
+                            AdnlMessage::Adnl_Message_Nop,
                             KeyId::from_data([0u8; 32])
                         );
                         if let Err(e) = node_stop.queue_send_loopback_packets.send(stop) {
@@ -2044,16 +2046,19 @@ impl AdnlNode {
                                 &query,
                                 &peers_local
                             ).await {
-                                Ok(Some(AdnlMessage::Adnl_Message_Answer(answer))) => answer,
-                                Ok(Some(x)) => {
-                                    log::warn!(target: TARGET, "Unexpected reply {:?}", x);
-                                    return
-                                },
+                                Ok(Some(answer)) => answer,
                                 Err(e) => {
                                     log::warn!(target: TARGET, "ERROR --> {}", e);
                                     return
                                 },
                                 _ => return
+                            };
+                            let answer = match answer.object {
+                                AdnlMessage::Adnl_Message_Answer(answer) => answer,
+                                x => {
+                                    log::warn!(target: TARGET, "Unexpected reply {:?}", x);
+                                    return
+                                }
                             };
                             if let Err(e) = node_loop.process_answer(&answer, &src).await {
                                 log::warn!(target: TARGET, "ERROR --> {}", e);
@@ -2241,7 +2246,7 @@ impl AdnlNode {
     /// Send query
     pub async fn query(
         self: Arc<AdnlNode>, 
-        query: &TLObject,
+        query: &TaggedTlObject,
         peers: &AdnlPeers,
         timeout: Option<u64>
     ) -> Result<Option<TLObject>> {
@@ -2252,7 +2257,7 @@ impl AdnlNode {
     pub async fn query_with_prefix(
         self: Arc<AdnlNode>,  
         prefix: Option<&[u8]>,
-        query: &TLObject,
+        query: &TaggedTlObject,
         peers: &AdnlPeers,
         timeout: Option<u64>
     ) -> Result<Option<TLObject>> {
@@ -2348,7 +2353,10 @@ impl AdnlNode {
                         }
                     } else {
                         reader.close();
-                        fail!("INTERNAL ERROR: 1st query reply to {:?} read mismatch", query);
+                        fail!(
+                            "INTERNAL ERROR: 1st query reply to {:?} read mismatch", 
+                            query.object
+                        );
                     };
                     if let Some(reply) = reply {
                         tokio::spawn(
@@ -2369,7 +2377,10 @@ impl AdnlNode {
                         reply
                     } else {
                         reader.close();
-                        fail!("INTERNAL ERROR: 2nd query reply to {:?} read mismatch", query);
+                        fail!(
+                            "INTERNAL ERROR: 2nd query reply to {:?} read mismatch", 
+                            query.object
+                        );
                     }
                 }
             }
@@ -2422,10 +2433,18 @@ impl AdnlNode {
     }
 
     /// Send custom message
-    pub fn send_custom(&self, data: &[u8], peers: AdnlPeers) -> Result<()> {
-        let msg = AdnlCustomMessage {
-            data: ton::bytes(data.to_vec())
-        }.into_boxed();
+    pub fn send_custom(
+        &self, 
+        data: &TaggedByteSlice, 
+        peers: AdnlPeers,
+    ) -> Result<()> {
+        let msg = TaggedAdnlMessage {
+            object: AdnlCustomMessage {
+                data: ton::bytes(data.object.to_vec())
+            }.into_boxed(),
+            #[cfg(feature = "telemetry")]
+            tag: data.tag
+        };
         match self.send_message_to_peer(msg, &peers, false)? {
             MessageRepeat::Unapplicable => Ok(()), 
             x => fail!("INTERNAL ERROR: bad repeat {:?} in ADNL custom message", x)
@@ -2578,9 +2597,13 @@ impl AdnlNode {
                     Ordering::Less => {
                         // Push peer to refresh reinit date
                         self.send_message_to_peer(
-                            AdnlMessage::Adnl_Message_Nop,
+                            TaggedAdnlMessage {
+                                object: AdnlMessage::Adnl_Message_Nop,
+                                #[cfg(feature = "telemetry")]
+                                tag: 0x80000000 // Service message, tag is not important
+                            },
                             &AdnlPeers::with_keys(local_key.clone(), ret.clone()),
-                            false
+                            false,
                         )?;
                         fail!(
                             "Destination reinit date is too old: {} vs {}, {:?}", 
@@ -2845,7 +2868,13 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
                 self.add_receive_subchannels(channel).await?;
 */
                 self.add_subchannels(channel, true).await?;
-                Some(msg)
+                Some(
+                    TaggedAdnlMessage {
+                        object: msg,
+                        #[cfg(feature = "telemetry")]
+                        tag: 0x80000000 // Service message, tag is not important
+                    }
+                )
             },
             AdnlMessage::Adnl_Message_Custom(custom) => {
                 if !Query::process_custom(subscribers, &custom, peers).await? {
@@ -2888,7 +2917,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
         subscribers: &Vec<Arc<dyn Subscriber>>,
         query: &AdnlQueryMessage,
         peers: &AdnlPeers
-    ) -> Result<Option<AdnlMessage>> {
+    ) -> Result<Option<TaggedAdnlMessage>> {
         let query_id = &query.query_id;
         log::info!(
             target: TARGET_QUERY, 
@@ -3034,12 +3063,12 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
     async fn send_query_with_priority(
         self: Arc<Self>, 
         prefix: Option<&[u8]>,
-        query: &TLObject,
+        query: &TaggedTlObject,
         peers: &AdnlPeers,
         timeout: Option<u64>,
         priority: bool
     ) -> Result<Arc<QuerySendContext>> {
-        let (query_id, msg) = Query::build(prefix, query)?;
+        let (query_id, msg) = Query::build(prefix, &query)?;
         let (ping, query) = Query::new();
         self.queries.insert(query_id, query);
         log::info!(
@@ -3048,7 +3077,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
             query_id[0], query_id[1], query_id[2], query_id[3]
         );
         let (channel, repeat) = if peers.local() == peers.other() {       
-            self.queue_send_loopback_packets.send((msg, peers.local().clone()))?;
+            self.queue_send_loopback_packets.send((msg.object, peers.local().clone()))?;
             (None, MessageRepeat::Unapplicable)
         } else {
             let channel = self.channels_send.get(peers.other()).map(|guard| guard.val().clone());
@@ -3068,7 +3097,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
 
     fn send_message_to_peer(
         &self, 
-        msg: AdnlMessage, 
+        msg: TaggedAdnlMessage, 
         peers: &AdnlPeers, 
         priority: bool
     ) -> Result<MessageRepeat> {
@@ -3099,7 +3128,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
             ret
         }
 
-        log::trace!(target: TARGET, "Send message {:?}", msg);
+        log::trace!(target: TARGET, "Send message {:?}", msg.object);
 
         let peer = self.peers(peers.local())?;
         let peer = if let Some(peer) = peer.get(peers.other()) {
@@ -3127,13 +3156,13 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
         } else {
             0
         };
-        size += match &msg {
+        size += match &msg.object {
             AdnlMessage::Adnl_Message_Answer(answer) => answer.answer.len() + SIZE_ANSWER_MSG,
             AdnlMessage::Adnl_Message_ConfirmChannel(_) => SIZE_CONFIRM_CHANNEL_MSG,
             AdnlMessage::Adnl_Message_Custom(custom) => custom.data.len() + SIZE_CUSTOM_MSG,
             AdnlMessage::Adnl_Message_Nop => SIZE_NOP_MSG,
             AdnlMessage::Adnl_Message_Query(query) => query.query.len() + SIZE_QUERY_MSG,
-            _ => fail!("Unexpected message to send {:?}", msg)  
+            _ => fail!("Unexpected message to send {:?}", msg.object)  
         };
         let channel = if let Some(ref channel) = channel {
             Some(channel.val())
@@ -3149,19 +3178,30 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
                     &src, 
                     channel, 
                     None, 
-                    Some(vec![create_channel_msg, msg]),
-                    priority
+                    Some(vec![create_channel_msg, msg.object]),
+                    priority,
+                    #[cfg(feature = "telemetry")]
+                    msg.tag
                 )
             } else {
-                self.send_packet(peer, &src, channel, Some(msg), None, priority)
+                self.send_packet(
+                    peer, 
+                    &src, 
+                    channel, 
+                    Some(msg.object), 
+                    None, 
+                    priority,
+                    #[cfg(feature = "telemetry")]
+                    msg.tag
+                )
             }
         } else {
-            let data = serialize(&msg)?;
+            let data = serialize(&msg.object)?;
             let hash = sha2::Sha256::digest(&data);
             let hash = arrayref::array_ref!(hash.as_slice(), 0, 32);            
             let mut offset = 0;
             let mut repeat = if let Some(create_channel_msg) = create_channel_msg {
-                let msg = build_part_message(
+                let part_msg = build_part_message(
                     &data[..], 
                     hash, 
                     &mut offset, 
@@ -3172,15 +3212,31 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
                     &src, 
                     channel, 
                     None, 
-                    Some(vec![create_channel_msg, msg]),
-                    priority
+                    Some(vec![create_channel_msg, part_msg]),
+                    priority,
+                    #[cfg(feature = "telemetry")]
+                    msg.tag
                 )?
             } else {
                 MessageRepeat::Unapplicable
             };
             while offset < data.len() {
-                let msg = build_part_message(&data[..], hash, &mut offset, Self::MAX_ADNL_MESSAGE);
-                let upd = self.send_packet(peer, &src, channel, Some(msg), None, priority)?;
+                let part_msg = build_part_message(
+                    &data[..], 
+                    hash, 
+                    &mut offset, 
+                    Self::MAX_ADNL_MESSAGE
+                );
+                let upd = self.send_packet(
+                    peer, 
+                    &src, 
+                    channel, 
+                    Some(part_msg), 
+                    None, 
+                    priority,
+                    #[cfg(feature = "telemetry")]
+                    msg.tag
+                )?;
                 if let MessageRepeat::Unapplicable = &repeat {
                     repeat = upd
                 } else if repeat != upd {
@@ -3199,7 +3255,9 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
         channel: Option<&Arc<AdnlChannel>>, 
         message: Option<AdnlMessage>, 
         messages: Option<Vec<AdnlMessage>>,
-        mut priority: bool
+        mut priority: bool,
+        #[cfg(feature = "telemetry")]
+        tag: u32
     ) -> Result<MessageRepeat> {
         let repeat = if priority {
             // Decide whether we need priority traffic
@@ -3287,6 +3345,25 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
         );
         #[cfg(feature = "telemetry")]
         peer.update_send_stats(data.len() as u64, source.id());
+        #[cfg(feature = "telemetry")]
+        if !priority {
+            loop {
+                if let Some(metric) = self.telemetry.send_ordinary_tags.get(&tag) {
+                    metric.val().update(1);
+                    break
+                }
+                let name = format!("Send ordinary {:08x}", tag);
+                let metric = Telemetry::create_metric_builder(name.as_str());
+                let added = add_object_to_map(
+                    &self.telemetry.send_ordinary_tags,
+                    tag,
+                    || Ok(metric.clone())
+                )?;
+                if added {
+                    self.telemetry.printer.add_metric(TelemetryItem::MetricBuilder(metric))
+                }
+            }
+        }
         let job = SendData { 
             destination: peer.address.ip_address.load(atomic::Ordering::Relaxed),
             data
