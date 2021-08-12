@@ -153,7 +153,7 @@ impl AdnlServerThread {
             };
             if consumed {
                 if let Some(msg) = reply {
-                    serialize_inplace(&mut buf, &msg)?;
+                    serialize_inplace(&mut buf, &msg.object)?;
                     crypto.send(&mut stream, &mut buf).await?;
                 }                
             } else {

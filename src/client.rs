@@ -2,7 +2,7 @@ use crate::{
     dump, 
     common::{
         AdnlHandshake, AdnlStream, AdnlStreamCrypto, deserialize, get256, 
-        KeyOption, KeyOptionJson, Query, serialize, TARGET, Timeouts
+        KeyOption, KeyOptionJson, Query, serialize, TaggedTlObject, TARGET, Timeouts
     }
 };
 use rand::Rng;
@@ -13,6 +13,8 @@ use ton_api::{
         rpc::adnl::Ping as AdnlPing
     }
 };
+#[cfg(feature = "telemetry")]
+use ton_api::{BoxedSerialize, ConstructorNumber};
 use ton_types::{fail, Result};
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -136,7 +138,14 @@ impl AdnlClient {
                 value 
             }
         );
-        let answer: AdnlPongBoxed = Query::parse(self.query(&query).await?, &query)?;
+        #[cfg(feature = "telemetry")]
+        let (ConstructorNumber(tag), _) = query.serialize_boxed();
+        let query = TaggedTlObject {
+            object: query,
+            #[cfg(feature = "telemetry")]
+            tag
+        };
+        let answer: AdnlPongBoxed = Query::parse(self.query(&query).await?, &query.object)?;
         if answer.value() != &value {
             fail!("Bad reply to ADNL ping")
         }
@@ -150,9 +159,9 @@ impl AdnlClient {
     }
 
     /// Query server
-    pub async fn query(&mut self, query: &TLObject) -> Result<TLObject> {
+    pub async fn query(&mut self, query: &TaggedTlObject) -> Result<TLObject> {
         let (query_id, msg) = Query::build(None, query)?;        
-        let mut buf = serialize(&msg)?;
+        let mut buf = serialize(&msg.object)?;
         self.crypto.send(&mut self.stream, &mut buf).await?;
         loop {
             self.crypto.receive(&mut buf, &mut self.stream).await?;
@@ -167,9 +176,9 @@ impl AdnlClient {
             AdnlMessage::Adnl_Message_Answer(answer) => if &query_id == get256(&answer.query_id) {
                 deserialize(&answer.answer)
             } else {
-                fail!("Query ID mismatch {:?} vs {:?}", query, answer)
+                fail!("Query ID mismatch {:?} vs {:?}", query.object, answer)
             },
-            _ => fail!("Unexpected answer to query {:?}: {:?}", query, answer)
+            _ => fail!("Unexpected answer to query {:?}: {:?}", query.object, answer)
         } 
     }
 
