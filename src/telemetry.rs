@@ -167,6 +167,7 @@ impl Metric {
         // Calculate maximum
         loop {
             let maximum = self.maximum.load(Ordering::Relaxed);
+            #[allow(clippy::collapsible_if)]
             if maximum < update {
                 if self.maximum.compare_exchange(
                     maximum, 

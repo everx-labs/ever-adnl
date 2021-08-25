@@ -531,7 +531,7 @@ impl KeyOption {
     pub fn from_type_and_public_key(type_id: i32, pub_key: &[u8; 32]) -> Self {
         Self {
             id: Self::calc_id(type_id, pub_key), 
-            keys: [Some(pub_key.clone()), None, None],
+            keys: [Some(*pub_key), None, None],
             type_id
         }
     }
@@ -593,7 +593,7 @@ impl KeyOption {
             fail!("Export is supported only for Ed25519 keys")
         }
         let ret = Ed25519 { 
-            key: ton::int256(self.pub_key()?.clone()) 
+            key: ton::int256(*self.pub_key()?) 
         }.into_boxed();
         Ok(ret)
     }
@@ -668,7 +668,7 @@ impl Query {
         };
         let msg = TaggedAdnlMessage {
             object: AdnlQueryMessage {
-                query_id: ton::int256(query_id.clone()),
+                query_id: ton::int256(query_id),
                 query: ton::bytes(query)
             }.into_boxed(),
             #[cfg(feature = "telemetry")]
@@ -691,7 +691,7 @@ impl Query {
     
     /// Process ADNL query
     pub async fn process_adnl(
-        subscribers: &Vec<Arc<dyn Subscriber>>,
+        subscribers: &[Arc<dyn Subscriber>],
         query: &AdnlQueryMessage,
         peers: &AdnlPeers                                                                    
     ) -> Result<(bool, Option<TaggedAdnlMessage>)> {
@@ -700,7 +700,7 @@ impl Query {
                 answer,
                 |answer| TaggedAdnlMessage {
                     object: AdnlAnswerMessage {
-                        query_id: query.query_id.clone(),  
+                        query_id: query.query_id,  
                         answer: ton::bytes(answer.object)
                     }.into_boxed(),
                     #[cfg(feature = "telemetry")]
@@ -714,7 +714,7 @@ impl Query {
 
     /// Process custom message
     pub async fn process_custom(
-        subscribers: &Vec<Arc<dyn Subscriber>>,
+        subscribers: &[Arc<dyn Subscriber>],
         custom: &AdnlCustomMessage,
         peers: &AdnlPeers
     ) -> Result<bool> {
@@ -728,7 +728,7 @@ impl Query {
 
     /// Process RLDP query
     pub async fn process_rldp(
-        subscribers: &Vec<Arc<dyn Subscriber>>,
+        subscribers: &[Arc<dyn Subscriber>],
         query: &RldpQuery,                                                               
         peers: &AdnlPeers     
     ) -> Result<(bool, Option<TaggedRldpAnswer>)> {
@@ -737,7 +737,7 @@ impl Query {
                 answer, 
                 |answer| TaggedRldpAnswer {
                     object: RldpAnswer {
-                        query_id: query.query_id.clone(),  
+                        query_id: query.query_id,  
                         data: ton::bytes(answer.object)
                     },
                     #[cfg(feature = "telemetry")]
@@ -768,7 +768,7 @@ impl Query {
     }
 
     async fn process(
-        subscribers: &Vec<Arc<dyn Subscriber>>,
+        subscribers: &[Arc<dyn Subscriber>],
         query: &[u8],
         peers: &AdnlPeers
     ) -> Result<(bool, Option<Answer>)> {
@@ -939,6 +939,7 @@ pub struct UpdatedAt {
     updated: AtomicU64
 }
 
+#[allow(clippy::new_without_default)] 
 impl UpdatedAt {
     pub fn new() -> Self {
         Self {
@@ -1007,7 +1008,7 @@ impl <T> Wait<T> {
         if empty { 
             // Graceful close
             queue_reader.close();
-            while let Some(_) = queue_reader.recv().await {
+            while queue_reader.recv().await.is_some() {
             }
         }
         ret
