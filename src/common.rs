@@ -1137,6 +1137,15 @@ pub fn tag_from_boxed_type<T: Default + BoxedSerialize>() -> u32 {
     tag
 }
 
+/// Get TL tag from data bytes
+pub fn tag_from_data(data: &[u8]) -> u32 {
+    if data.len() < 4 {
+        0
+    } else {
+        u32::from_le_bytes([data[0], data[1], data[2], data[3]])
+    }
+}
+
 /// Get TL tag from object
 pub fn tag_from_object<T: BoxedSerialize>(object: &T) -> u32 {
     let (ConstructorNumber(tag), _) = object.serialize_boxed();

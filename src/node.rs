@@ -8,7 +8,10 @@ use crate::{
     }
 };
 #[cfg(feature = "telemetry")]
-use crate::telemetry::{Metric, MetricBuilder, TelemetryItem, TelemetryPrinter};
+use crate::{
+    common::tag_from_data, 
+    telemetry::{Metric, MetricBuilder, TelemetryItem, TelemetryPrinter}
+};
 use aes_ctr::cipher::stream::SyncStreamCipher;
 use rand::Rng;
 use sha2::Digest;
@@ -1301,7 +1304,7 @@ struct QuerySendContext {
     reply_ping: Arc<tokio::sync::Barrier>
 }
 
-struct RecvPipeline {
+struct RecvPipeline {                        	
     adnl: Arc<AdnlNode>, 
 //    count: AtomicU64,
     max_workers: u64,
@@ -1348,11 +1351,11 @@ impl RecvPipeline {
             max_ordinary_workers,
             ordinary: Queue::new(
                 #[cfg(feature = "telemetry")]
-                adnl.telemetry.recv_ordinary_packets.clone()
+                adnl.telemetry.ordinary.recv_queue_packets.clone()
             ),
             priority: Queue::new(
                 #[cfg(feature = "telemetry")]
-                adnl.telemetry.recv_priority_packets.clone()
+                adnl.telemetry.priority.recv_queue_packets.clone()
             ),
             proc_ordinary_packets: AtomicU64::new(0),
             proc_priority_packets: AtomicU64::new(0),
@@ -1464,7 +1467,15 @@ impl RecvPipeline {
                     #[cfg(feature = "telemetry")] 
                     self.update_metric(priority);
                     match self.adnl.process_packet(&mut buf, subchannel, &self.subscribers).await {
-                        Err(e) => log::warn!(target: TARGET, "ERROR <-- {}", e),
+                        Err(e) => {
+                            log::warn!(target: TARGET, "ERROR <-- {}", e);
+                            #[cfg(feature = "telemetry")] 
+                            if priority {
+                                self.adnl.telemetry.priority.proc_invalid.update(1)
+                            } else {
+                                self.adnl.telemetry.ordinary.proc_invalid.update(1)
+                            }
+                        },
                         _ => ()
                     }
                     if priority {
@@ -1483,11 +1494,11 @@ impl RecvPipeline {
     #[cfg(feature = "telemetry")]
     fn update_metric(&self, priority: bool) {
         if priority {
-            self.adnl.telemetry.proc_priority_packets.update(
+            self.adnl.telemetry.priority.proc_packets.update(
                 self.proc_priority_packets.load(atomic::Ordering::Relaxed)
             )
         } else {
-            self.adnl.telemetry.proc_ordinary_packets.update(
+            self.adnl.telemetry.ordinary.proc_packets.update(
                 self.proc_ordinary_packets.load(atomic::Ordering::Relaxed)
             )
         }
@@ -1604,38 +1615,165 @@ type Peers = lockfree::map::Map<Arc<KeyId>, Peer>;
 type TransferId = [u8; 32];
 
 #[cfg(feature = "telemetry")]
+struct TelemetryByStage {
+    proc_packets: Arc<Metric>,          // Packets in processing
+    proc_invalid: Arc<MetricBuilder>,   // Packets with errors in processing
+    proc_skipped: Arc<MetricBuilder>,   // Skipped packets (due to failed checks)
+    proc_success: Arc<MetricBuilder>,   // Packets successfully processed
+    proc_unknown: Arc<MetricBuilder>,   // Packets to unknown address
+    recv_queue_packets: Arc<Metric>,    // Queued received packets
+    send_queue_packets: Arc<Metric>,    // Queued packets to send
+    send_tags: lockfree::map::Map<u32, Arc<MetricBuilder>>,
+}
+
+#[cfg(feature = "telemetry")]
+impl TelemetryByStage {
+    fn with_priority(priority: bool) -> Self {
+        let priority = if priority {
+            "priority"
+        } else {
+            "ordinary"
+        };
+        Self {
+            proc_packets: Telemetry::create_metric(
+                format!("{} packets, in progress", priority).as_str()
+            ),
+            proc_invalid: Telemetry::create_metric_builder(
+                format!("proc {} invalid, packets/sec", priority).as_str()
+            ),
+            proc_skipped: Telemetry::create_metric_builder(
+                format!("proc {} skipped, packets/sec", priority).as_str()
+            ),
+            proc_success: Telemetry::create_metric_builder(
+                format!("proc {} success, packets/sec", priority).as_str()
+            ),
+            proc_unknown: Telemetry::create_metric_builder(
+                format!("proc {} unknown, packets/sec", priority).as_str()
+            ),
+            recv_queue_packets: Telemetry::create_metric(
+                format!("{} packets, recv queue", priority).as_str()
+            ),
+            send_queue_packets: Telemetry::create_metric(
+                format!("{} packets, send queue", priority).as_str()
+            ),
+            send_tags: lockfree::map::Map::new()
+        } 
+    }
+}
+
+#[cfg(feature = "telemetry")]
+struct TelemetryCheck {
+    start: Instant,
+    info: String
+}
+
+#[cfg(feature = "telemetry")]
 struct Telemetry {
-    proc_ordinary_packets: Arc<Metric>,
-    proc_priority_packets: Arc<Metric>,
-    recv_ordinary_packets: Arc<Metric>,
-    recv_priority_packets: Arc<Metric>,
+    ordinary: TelemetryByStage,
+    priority: TelemetryByStage,
     recv_sock: Arc<MetricBuilder>,
-    recv_tmp1: Arc<Metric>,
-    recv_tmp2: Arc<Metric>,
-    recv_tmp3: Arc<Metric>,
-    send_ordinary_packets: Arc<Metric>,
-    send_ordinary_tags: lockfree::map::Map<u32, Arc<MetricBuilder>>,
-    send_priority_packets: Arc<Metric>,
     send_sock: Arc<MetricBuilder>,
+    check_id: AtomicU64,
+    check_map: lockfree::map::Map::<u64, TelemetryCheck>,
+    check_queue: lockfree::queue::Queue<u64>,
     printer: TelemetryPrinter
 }
 
 #[cfg(feature = "telemetry")]
 impl Telemetry {
-    const PERIOD_AVERAGE_SECS: u64 = 5;    
-    const PERIOD_MEASURE_NANOS: u64 = 1000000000;    
+
+    const PERIOD_AVERAGE_SEC: u64 = 5;    
+    const PERIOD_MEASURE_NANO: u64 = 1000000000;    
+    const TIMEOUT_PROCESSING_MS: u64 = 500;    
+
+    fn add_check(&self, info: String) -> Result<u64> {
+        loop {
+            let id = self.check_id.fetch_add(1, atomic::Ordering::Relaxed);
+            let added = add_object_to_map(
+                &self.check_map,
+                id,
+                || Ok(
+                    TelemetryCheck {
+                        start: Instant::now(),
+                        info: info.clone()
+                    }
+                )
+            )?;
+            if added {
+                self.check_queue.push(id);
+                break Ok(id)
+            }
+        }
+    }
+
     fn create_metric(name: &str) -> Arc<Metric> {
-        Metric::without_totals(name, Self::PERIOD_AVERAGE_SECS)
+        Metric::without_totals(name, Self::PERIOD_AVERAGE_SEC)
     }
+
     fn create_metric_with_total(name: &str) -> Arc<Metric> {
-	Metric::with_total_amount(name, Self::PERIOD_AVERAGE_SECS)
+	Metric::with_total_amount(name, Self::PERIOD_AVERAGE_SEC)
     }
+
     fn create_metric_builder(name: &str) -> Arc<MetricBuilder> {
         MetricBuilder::with_metric_and_period(
             Self::create_metric_with_total(name),
-            Self::PERIOD_MEASURE_NANOS
+            Self::PERIOD_MEASURE_NANO
         )
     }
+
+    fn drop_check(&self, id: u64) {
+        self.check_map.remove(&id);
+    }
+
+    fn evaluate_checks(&self) {
+        let mut until = None;
+        while let Some(id) = self.check_queue.pop() {
+            if let Some(until_id) = &until {
+                if *until_id == id {
+                    self.check_queue.push(id);
+                    break
+                }
+            } 
+            if let Some(check) = self.check_map.get(&id) {
+                let check = check.val();
+                let elapsed = check.start.elapsed().as_millis() as u64;
+                if elapsed >= Self::TIMEOUT_PROCESSING_MS {
+                    log::warn!(
+                        target: TARGET, 
+                        "Too long processing of {}: {} ms", 
+                        check.info, 
+                        elapsed
+                    ) 
+                }
+                if until.is_none() {
+                    until.replace(id);
+                }
+                self.check_queue.push(id)
+            }
+        }
+    }
+
+    fn get_message_info(msg: &AdnlMessage) -> String {
+        match msg {
+            AdnlMessage::Adnl_Message_Part(part) => 
+                format!("AdnlMessagePart offset {} of {}", part.offset, part.total_size),
+            AdnlMessage::Adnl_Message_Answer(answer) => 
+                format!("AdnlMessageAnswer tag {:08x}", tag_from_data(&answer.answer)),
+            AdnlMessage::Adnl_Message_ConfirmChannel(_) => 
+                "AdnlMessageConfirmChannel".to_string(),
+            AdnlMessage::Adnl_Message_CreateChannel(_) =>
+                "AdnlMessageCreateChannel".to_string(),
+            AdnlMessage::Adnl_Message_Custom(custom) =>
+                format!("AdnlMessageCustom tag {:08x}", tag_from_data(&custom.data)),
+            AdnlMessage::Adnl_Message_Nop =>
+                "AdnlMessageNop".to_string(),
+            AdnlMessage::Adnl_Message_Query(query) =>
+                format!("AdnlMessageQuery tag {:08x}", tag_from_data(&query.query)),
+            AdnlMessage::Adnl_Message_Reinit(_) =>
+                "AdnlMessageReinit".to_string()
+        }
+    }
+
 }
 
 type LoopbackReader = tokio::sync::mpsc::UnboundedReceiver<(AdnlMessage, Arc<KeyId>)>;
@@ -1662,17 +1800,17 @@ pub struct AdnlNode {
 
 impl AdnlNode {
 
-    const CLOCK_TOLERANCE: i32 = 60;         // Seconds
+    const CLOCK_TOLERANCE_SEC: i32 = 60; 
     const MAX_ADNL_MESSAGE: usize = 1024;
     const MAX_PACKETS_IN_PROGRESS: u64 = 512;
     const SIZE_BUFFER: usize = 2048;
-    const TIMEOUT_ADDRESS: i32 = 1000;       // Seconds
-    const TIMEOUT_CHANNEL_RESET: u64 = 30;   // Seconds
-    const TIMEOUT_QUERY_MIN: u64 = 500;      // Milliseconds
-    const TIMEOUT_QUERY_MAX: u64 = 5000;     // Milliseconds
-    const TIMEOUT_QUERY_STOP: u64 = 1;       // Milliseconds
-    const TIMEOUT_SHUTDOWN: u64 = 2000;      // Milliseconds
-    const TIMEOUT_TRANSFER: u64 = 3;         // Seconds
+    const TIMEOUT_ADDRESS_SEC: i32 = 1000;       
+    const TIMEOUT_CHANNEL_RESET_SEC: u64 = 30;   
+    const TIMEOUT_QUERY_MIN_MS: u64 = 500;   
+    const TIMEOUT_QUERY_MAX_MS: u64 = 5000; 
+    const TIMEOUT_QUERY_STOP_MS: u64 = 1; 
+    const TIMEOUT_SHUTDOWN_MS: u64 = 2000; 
+    const TIMEOUT_TRANSFER_SEC: u64 = 3;
     
     /// Constructor
     pub async fn with_config(mut config: AdnlNodeConfig) -> Result<Arc<Self>> {
@@ -1701,46 +1839,39 @@ impl AdnlNode {
         let incinerator = lockfree::map::SharedIncin::new();
         #[cfg(feature = "telemetry")] 
         let telemetry = {
-            let proc_ordinary_packets = Telemetry::create_metric_with_total("ordinary packets, in proc, #");
-            let proc_priority_packets = Telemetry::create_metric_with_total("priority packets, in proc, #");
-            let recv_ordinary_packets = Telemetry::create_metric("recv queue, ordinary packets");
-            let recv_priority_packets = Telemetry::create_metric("recv queue, priority packets");
+            let ordinary = TelemetryByStage::with_priority(false);
+            let priority = TelemetryByStage::with_priority(true);
             let recv_sock = Telemetry::create_metric_builder("socket recv, packets/sec");
-            let recv_tmp1 = Telemetry::create_metric_with_total("peer recv 1, packets");
-            let recv_tmp2 = Telemetry::create_metric_with_total("peer recv 2, packets");
-            let recv_tmp3 = Telemetry::create_metric_with_total("peer recv 3, packets");
-            let send_ordinary_packets = Telemetry::create_metric("send queue, ordinary packets");
-            let send_priority_packets = Telemetry::create_metric("send queue, priority packets");
             let send_sock = Telemetry::create_metric_builder("socket send, packets/sec");
             let printer = TelemetryPrinter::with_params(
-                Telemetry::PERIOD_AVERAGE_SECS, 
+                Telemetry::PERIOD_AVERAGE_SEC, 
                 vec![
                     TelemetryItem::MetricBuilder(recv_sock.clone()),
-                    TelemetryItem::Metric(recv_priority_packets.clone()),    
-                    TelemetryItem::Metric(recv_ordinary_packets.clone()),    
-                    TelemetryItem::Metric(proc_priority_packets.clone()),
-                    TelemetryItem::Metric(proc_ordinary_packets.clone()),
-                    TelemetryItem::Metric(send_ordinary_packets.clone()),    
-                    TelemetryItem::Metric(send_priority_packets.clone()),    
-                    TelemetryItem::MetricBuilder(send_sock.clone()),
-                    TelemetryItem::Metric(recv_tmp1.clone()),    
-                    TelemetryItem::Metric(recv_tmp2.clone()),
-                    TelemetryItem::Metric(recv_tmp3.clone())
+                    TelemetryItem::Metric(priority.recv_queue_packets.clone()),
+                    TelemetryItem::Metric(ordinary.recv_queue_packets.clone()),
+                    TelemetryItem::Metric(priority.proc_packets.clone()), 
+                    TelemetryItem::MetricBuilder(priority.proc_invalid.clone()),
+                    TelemetryItem::MetricBuilder(priority.proc_unknown.clone()),
+                    TelemetryItem::MetricBuilder(priority.proc_skipped.clone()),
+                    TelemetryItem::MetricBuilder(priority.proc_success.clone()),
+                    TelemetryItem::Metric(ordinary.proc_packets.clone()),
+                    TelemetryItem::MetricBuilder(ordinary.proc_invalid.clone()),
+                    TelemetryItem::MetricBuilder(ordinary.proc_unknown.clone()),
+                    TelemetryItem::MetricBuilder(ordinary.proc_skipped.clone()),
+                    TelemetryItem::MetricBuilder(ordinary.proc_success.clone()),
+                    TelemetryItem::Metric(priority.send_queue_packets.clone()),
+                    TelemetryItem::Metric(ordinary.send_queue_packets.clone()),
+                    TelemetryItem::MetricBuilder(send_sock.clone())
                 ]
             );
             Telemetry {
-                proc_ordinary_packets,
-                proc_priority_packets,
-                recv_ordinary_packets,
-                recv_priority_packets,
+                ordinary,
+                priority,
                 recv_sock,
-                recv_tmp1,
-                recv_tmp2,
-                recv_tmp3,
-                send_ordinary_packets,
-                send_ordinary_tags: lockfree::map::Map::new(), 
-                send_priority_packets,
                 send_sock,
+                check_id: AtomicU64::new(0),
+                check_map: lockfree::map::Map::new(),
+                check_queue: lockfree::queue::Queue::new(), 
                 printer
             }
         };
@@ -1756,9 +1887,9 @@ impl AdnlNode {
             queue_send_loopback_readers: lockfree::queue::Queue::new(),
             send_pipeline: SendPipeline::new(
                 #[cfg(feature = "telemetry")]
-                telemetry.send_ordinary_packets.clone(),
+                telemetry.ordinary.send_queue_packets.clone(),
                 #[cfg(feature = "telemetry")]
-                telemetry.send_priority_packets.clone()
+                telemetry.priority.send_queue_packets.clone()
             ),
             start_time: Version::get(),
             stop: Arc::new(AtomicU32::new(0)),
@@ -1817,18 +1948,27 @@ impl AdnlNode {
         let start = Arc::new(Instant::now());
         let subscribers = Arc::new(subscribers);
         let subscribers_local = subscribers.clone();
+        let subscribers_stop = Arc::new(AtomicU32::new(0));
         for subscriber in subscribers.iter() {
             let node_subs = node.clone();
             let start = start.clone();
             let subscriber = subscriber.clone();
+            let subscribers_stop = subscribers_stop.clone();
+            subscribers_stop.fetch_add(1, atomic::Ordering::Relaxed);
             tokio::spawn(
                 async move {
                     loop {
-                        tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_QUERY_STOP)).await;
+                        tokio::time::sleep(
+                            Duration::from_millis(Self::TIMEOUT_QUERY_STOP_MS)
+                        ).await;
                         if node_subs.stop.load(atomic::Ordering::Relaxed) > 0 {      
                             break
                         }  
                         subscriber.poll(&start).await;
+                    }
+                    if subscribers_stop.fetch_sub(1, atomic::Ordering::Relaxed) == 1 {
+                        node_subs.stop.fetch_add(1, atomic::Ordering::Relaxed);                                                                                                         
+                        log::warn!(target: TARGET, "Node subscriber poll exited");
                     }
                 }
             );
@@ -1846,10 +1986,17 @@ impl AdnlNode {
         tokio::spawn(
             async move {
                 let mut monitor_queries: Vec<(u128, QueryId)> = Vec::new();
+                #[cfg(feature = "telemetry")] 
+                let mut last_check = Instant::now();
                 loop {
-                    tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_QUERY_STOP)).await;
+                    tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_QUERY_STOP_MS)).await;
                     #[cfg(feature = "telemetry")] 
                     node_stop.telemetry.printer.try_print();
+                    #[cfg(feature = "telemetry")] 
+                    if last_check.elapsed().as_secs() >= Telemetry::PERIOD_AVERAGE_SEC {
+                        node_stop.telemetry.evaluate_checks();
+                        last_check = Instant::now();
+                    }
                     if node_stop.stop.load(atomic::Ordering::Relaxed) > 0 {      
                         node_stop.send_pipeline.shutdown();
                         let stop = (
@@ -2077,12 +2224,12 @@ impl AdnlNode {
         log::warn!(target: TARGET, "Stopping ADNL node");
         self.stop.fetch_add(1, atomic::Ordering::Relaxed);
         loop {
-            tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_QUERY_STOP)).await;
-            if self.stop.load(atomic::Ordering::Relaxed) >= 5 {
+            tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_QUERY_STOP_MS)).await;
+            if self.stop.load(atomic::Ordering::Relaxed) >= 6 {
                 break
             }
         }
-        tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_SHUTDOWN)).await;
+        tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_SHUTDOWN_MS)).await;
         log::warn!(target: TARGET, "ADNL node stopped");
     }
 
@@ -2184,9 +2331,9 @@ impl AdnlNode {
 
     /// Calculate timeout from roundtrip, milliseconds
     pub fn calc_timeout(roundtrip: Option<u64>) -> u64 {
-        let timeout = roundtrip.unwrap_or(Self::TIMEOUT_QUERY_MAX);
-        if timeout < Self::TIMEOUT_QUERY_MIN {
-            Self::TIMEOUT_QUERY_MIN
+        let timeout = roundtrip.unwrap_or(Self::TIMEOUT_QUERY_MAX_MS);
+        if timeout < Self::TIMEOUT_QUERY_MIN_MS {
+            Self::TIMEOUT_QUERY_MIN_MS
         } else {
             timeout
         }
@@ -2617,7 +2764,7 @@ impl AdnlNode {
             let other_reinit_date = peer.send_state.reinit_date();
             match reinit_date.cmp(&other_reinit_date) {
                 Ordering::Equal => (),
-                Ordering::Greater => if *reinit_date > Version::get() + Self::CLOCK_TOLERANCE {
+                Ordering::Greater => if *reinit_date > Version::get() + Self::CLOCK_TOLERANCE_SEC {
                     fail!("Source reinit date is too new: {}", reinit_date)
                 } else {
                     peer.send_state.reset_reinit_date(*reinit_date);
@@ -2784,9 +2931,9 @@ impl AdnlNode {
                         async move {
                             loop {
                                 tokio::time::sleep(
-                                    Duration::from_millis(Self::TIMEOUT_TRANSFER * 100)
+                                    Duration::from_millis(Self::TIMEOUT_TRANSFER_SEC * 100)
                                 ).await;
-                                if transfer_wait.updated.is_expired(Self::TIMEOUT_TRANSFER) {
+                                if transfer_wait.updated.is_expired(Self::TIMEOUT_TRANSFER_SEC) {
                                     if transfers_wait.remove(&transfer_id_wait).is_some() {
                                         log::debug!(
                                             target: TARGET, 
@@ -2959,7 +3106,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
                         let now = Version::get() as u64;
                         let was = channel.flags.compare_exchange(
                             flags,
-                            flags | (now + Self::TIMEOUT_CHANNEL_RESET),
+                            flags | (now + Self::TIMEOUT_CHANNEL_RESET_SEC),
                             atomic::Ordering::Relaxed,
                             atomic::Ordering::Relaxed
                         ).unwrap_or_else(|was| was);
@@ -3000,6 +3147,8 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
                     "Received message to unknown key ID {}", 
                     base64::encode(&buf[0..32])
                 );
+                #[cfg(feature = "telemetry")]
+                self.telemetry.ordinary.proc_unknown.update(1);
                 return Ok(())
             },
             Subchannel::Ordinary(channel) => {
@@ -3011,8 +3160,6 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
                 (true, channel.local_key.clone(), Some(channel.other_key.clone()))
             }
         };
-        #[cfg(feature = "telemetry")]
-        self.telemetry.recv_tmp1.update(1);
         let pkt = deserialize(&buf[..])?
             .downcast::<AdnlPacketContentsBoxed>()
             .map_err(|pkt| failure::format_err!("Unsupported ADNL packet format {:?}", pkt))?
@@ -3026,36 +3173,59 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
             key
         } else {
             #[cfg(feature = "telemetry")]
-            self.telemetry.recv_tmp2.update(1);
+            if priority {
+                self.telemetry.priority.proc_invalid.update(1)
+            } else {
+                self.telemetry.ordinary.proc_invalid.update(1)
+            }
             return Ok(())
         };
-        #[cfg(feature = "telemetry")]
-        self.telemetry.recv_tmp3.update(1);
-        #[cfg(feature = "telemetry")]
-        if let Some(peer) = self.peers(&local_key)?.get(&other_key) {
-            peer.val().update_recv_stats(received_len as u64, &local_key)
-        }
         let peers = Arc::new(AdnlPeers::with_keys(local_key, other_key));
+        #[cfg(feature = "telemetry")]
+        if let Some(peer) = self.peers(peers.local())?.get(peers.other()) {
+            peer.val().update_recv_stats(received_len as u64, peers.local())
+        }
         if let Some(msg) = pkt.message { 
-            self.process_message(
+            #[cfg(feature = "telemetry")]
+            let chk = self.telemetry.add_check(Telemetry::get_message_info(&msg))?;
+            let res = self.process_message(
                 subscribers, 
                 msg, 
                 &peers,
                 priority
-            ).await?
+            ).await;
+            #[cfg(feature = "telemetry")]
+            self.telemetry.drop_check(chk);
+            res
         } else if let Some(msgs) = pkt.messages {
+            let mut res = Ok(());
             for msg in msgs.0 {
-                self.process_message(
+                #[cfg(feature = "telemetry")]
+                let chk = self.telemetry.add_check(Telemetry::get_message_info(&msg))?;
+                res = self.process_message(
                     subscribers, 
-                    msg, 
+                    msg,
                     &peers,
                     priority
-                ).await?;
-            } 
+                ).await;
+                #[cfg(feature = "telemetry")]
+                self.telemetry.drop_check(chk);
+                if res.is_err() {
+                    break
+                }
+            }
+            res 
         } else {
             // Specifics of implementation. 
             // Address/seqno update is to be sent serarately from data
             // fail!("ADNL packet ({}) without a message: {:?}", buf.len(), pkt)
+            Ok(())
+        }?;
+        #[cfg(feature = "telemetry")]
+        if priority {
+            self.telemetry.priority.proc_success.update(1)
+        } else {
+            self.telemetry.ordinary.proc_success.update(1)
         }
         Ok(())
     }
@@ -3084,7 +3254,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
             (channel, self.send_message_to_peer(msg, &peers, priority)?)
         };
         self.queue_monitor_queries.push(
-            (timeout.unwrap_or(Self::TIMEOUT_QUERY_MAX), query_id)
+            (timeout.unwrap_or(Self::TIMEOUT_QUERY_MAX_MS), query_id)
         );
         let ret = QuerySendContext {
             channel, 
@@ -3304,7 +3474,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
                     None
                 },
                 address: Some(
-                    self.build_address_list(Some(Version::get() + Self::TIMEOUT_ADDRESS))?
+                    self.build_address_list(Some(Version::get() + Self::TIMEOUT_ADDRESS_SEC))?
                 ),
                 priority_address: None,
                 seqno: Some(peer.send_state.next_seqno(priority) as i64),
@@ -3348,14 +3518,14 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
         #[cfg(feature = "telemetry")]
         if !priority {
             loop {
-                if let Some(metric) = self.telemetry.send_ordinary_tags.get(&tag) {
+                if let Some(metric) = self.telemetry.ordinary.send_tags.get(&tag) {
                     metric.val().update(1);
                     break
                 }
                 let name = format!("Send ordinary {:08x}", tag);
                 let metric = Telemetry::create_metric_builder(name.as_str());
                 let added = add_object_to_map(
-                    &self.telemetry.send_ordinary_tags,
+                    &self.telemetry.ordinary.send_tags,
                     tag,
                     || Ok(metric.clone())
                 )?;
