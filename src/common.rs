@@ -10,7 +10,7 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ton_api::{
-    BoxedSerialize, ConstructorNumber, Deserializer, IntoBoxed, Serializer, 
+    AnyBoxedSerialize, BoxedSerialize, ConstructorNumber, Deserializer, IntoBoxed, Serializer, 
     ton::{
         self, TLObject, 
         adnl::{
@@ -390,6 +390,54 @@ pub enum Answer {
     Raw(TaggedByteVec)
 }
 
+/// Counted object
+pub trait CountedObject {
+    fn counter(&self) -> &Counter;
+}
+
+impl <T: CountedObject> CountedObject for Arc<T> {
+    fn counter(&self) -> &Counter {
+        self.as_ref().counter()
+    }
+}
+
+pub struct Counter(Arc<AtomicU64>);
+
+impl From<Arc<AtomicU64>> for Counter {
+    fn from(counter: Arc<AtomicU64>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for Counter {
+    fn drop(&mut self) {
+        let Counter(counter) = self;
+        counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[macro_export]
+macro_rules! declare_counted {
+    (
+        $(#[$attr_struct: meta])? 
+        $vis: vis struct $struct: ident $(<$tt: tt>)? { 
+            $($(#[$attr_element: meta])? $element: ident : $ty: ty), *
+        }
+    ) => {
+        $(#[$attr_struct])?
+        $vis struct $struct $(<$tt>)? {
+            $($(#[$attr_element])? $element: $ty,)*
+            counter: Counter
+        }
+        impl $(<$tt>)? CountedObject for $struct $(<$tt>)? {
+            fn counter(&self) -> &Counter {
+                &self.counter
+           }
+        }
+    }
+}
+
 /// ADNL key ID (node ID)
 #[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]
 pub struct KeyId([u8; 32]);
@@ -680,11 +728,11 @@ impl Query {
     /// Parse answer
     pub fn parse<Q, A>(answer: TLObject, query: &Q) -> Result<A> 
     where 
-        A: BoxedSerialize + Send + Sync + serde::Serialize + 'static,
+        A: AnyBoxedSerialize,
         Q: Debug
     {
         match answer.downcast::<A>() {
-            Ok(answer) => Ok(answer), 
+            Ok(answer) => Ok(answer),
             Err(answer) => fail!("Unsupported response to {:?}: {:?}", query, answer)
         }
     }
@@ -821,7 +869,7 @@ impl QueryResult {
         #[cfg(feature = "telemetry")]
         tag: Option<u32>
     ) -> Result<Self> 
-        where <A as IntoBoxed>::Boxed: Send + Sync + serde::Serialize + 'static 
+        where <A as IntoBoxed>::Boxed: AnyBoxedSerialize
     {
         QueryResult::consume_boxed(
             answer.into_boxed(),
@@ -836,7 +884,7 @@ impl QueryResult {
         #[cfg(feature = "telemetry")]
         tag: Option<u32>
     ) -> Result<Self> 
-        where A: BoxedSerialize + Send + Sync + serde::Serialize + 'static
+        where A: AnyBoxedSerialize
     {
         let object = TLObject::new(answer);
         #[cfg(feature = "telemetry")]
@@ -1016,13 +1064,31 @@ impl <T> Wait<T> {
 
 }
 
-/// Add object to map
-pub fn add_object_to_map<K: Hash + Ord, V>(
+/// Add counted object to map
+pub fn add_counted_object_to_map<K: Hash + Ord, V: CountedObject>(
+    to: &lockfree::map::Map<K, V>, 
+    key: K, 
+    factory: impl FnMut() -> Result<V>
+) -> Result<bool> {
+    add_unbound_object_to_map(to, key, factory)
+}
+
+/// Add or update counted object in map
+pub fn add_counted_object_to_map_with_update<K: Hash + Ord, V: CountedObject>(
+    to: &lockfree::map::Map<K, V>, 
+    key: K, 
+    factory: impl FnMut(Option<&V>) -> Result<Option<V>>
+) -> Result<bool> {
+    add_unbound_object_to_map_with_update(to, key, factory)
+}
+
+/// Add unbound object to map
+pub fn add_unbound_object_to_map<K: Hash + Ord, V>(
     to: &lockfree::map::Map<K, V>, 
     key: K, 
     mut factory: impl FnMut() -> Result<V>
 ) -> Result<bool> {
-    add_object_to_map_with_update(
+    add_unbound_object_to_map_with_update(
         to,
         key,
         |found| if found.is_some() {
@@ -1032,9 +1098,9 @@ pub fn add_object_to_map<K: Hash + Ord, V>(
         }
     )
 }
-
-/// Add or update object in map
-pub fn add_object_to_map_with_update<K: Hash + Ord, V>(
+                
+/// Add or update unbound object in map
+pub fn add_unbound_object_to_map_with_update<K: Hash + Ord, V>(
     to: &lockfree::map::Map<K, V>, 
     key: K, 
     mut factory: impl FnMut(Option<&V>) -> Result<Option<V>>
@@ -1157,5 +1223,3 @@ pub fn tag_from_unboxed_type<T: Default + IntoBoxed>() -> u32 {
     let (ConstructorNumber(tag), _) = T::default().into_boxed().serialize_boxed();
     tag
 }
-
-
