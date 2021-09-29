@@ -10,7 +10,7 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ton_api::{
-    AnyBoxedSerialize, BoxedSerialize, ConstructorNumber, Deserializer, IntoBoxed, Serializer, 
+    AnyBoxedSerialize, BareSerialize, BoxedSerialize, ConstructorNumber, Deserializer, IntoBoxed, Serializer, 
     ton::{
         self, TLObject, 
         adnl::{
@@ -1197,6 +1197,19 @@ pub fn serialize_inplace<T: BoxedSerialize>(buf: &mut Vec<u8>, object: &T) -> Re
     serialize_append(buf, object)
 }
 
+/// Serialize TL object into bytes
+pub fn serialize_boxed<T: BareSerialize>(object: &T) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    Serializer::new(&mut buf).write_into_boxed(object)?;
+    Ok(buf)
+}
+
+/// Serialize TL object into bytes in-place
+pub fn serialize_boxed_inplace<T: BareSerialize>(buf: &mut Vec<u8>, object: &T) -> Result<()> {
+    buf.truncate(0);
+    Serializer::new(buf).write_into_boxed(object)
+}
+
 /// Get TL tag from boxed type
 pub fn tag_from_boxed_type<T: Default + BoxedSerialize>() -> u32 {
     let (ConstructorNumber(tag), _) = T::default().serialize_boxed();
@@ -1219,7 +1232,15 @@ pub fn tag_from_object<T: BoxedSerialize>(object: &T) -> u32 {
 }
 
 /// Get TL tag from unboxed type
+#[cfg(feature = "telemetry")]
 pub fn tag_from_unboxed_type<T: Default + IntoBoxed>() -> u32 {
     let (ConstructorNumber(tag), _) = T::default().into_boxed().serialize_boxed();
+    tag
+}
+
+/// Get TL tag from unboxed object
+#[cfg(feature = "telemetry")]
+pub fn tag_from_unboxed_object<T: BareSerialize>(object: &T) -> u32 {
+    let ConstructorNumber(tag) = object.constructor();
     tag
 }
