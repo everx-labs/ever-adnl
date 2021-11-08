@@ -1,21 +1,18 @@
 use crate::{
-    dump, 
     common::{
         AdnlHandshake, AdnlStream, AdnlStreamCrypto, deserialize, get256, 
-        KeyOption, KeyOptionJson, Query, serialize, TaggedTlObject, TARGET, Timeouts
+        KeyOption, KeyOptionJson, Query, serialize, TaggedTlObject, Timeouts
     }
 };
 use rand::Rng;
-use std::{net::SocketAddr, time::{Duration, SystemTime}};
-use ton_api::{
-    ton::{
-        TLObject, adnl::{Message as AdnlMessage, Pong as AdnlPongBoxed},
-        rpc::adnl::Ping as AdnlPing
-    }
+use std::{convert::TryInto, net::SocketAddr, time::{Duration, SystemTime}};
+use ton_api::ton::{
+    TLObject, adnl::{Message as AdnlMessage, Pong as AdnlPongBoxed},
+    rpc::adnl::Ping as AdnlPing
 };
 #[cfg(feature = "telemetry")]
 use ton_api::{BoxedSerialize, ConstructorNumber};
-use ton_types::{fail, Result};
+use ton_types::{error, fail, Result};
 
 #[derive(serde::Deserialize, serde::Serialize)]
 pub struct AdnlClientConfigJson {
@@ -113,7 +110,7 @@ impl AdnlClient {
         //socket.bind(&"0.0.0.0:0".parse::<SocketAddr>()?.into())?;
         socket.connect_timeout(
             &config.server_address.into(), 
-            config.timeouts.write().unwrap()
+            config.timeouts.write()
         )?;
 
         let mut stream = AdnlStream::from_stream_with_timeouts(
@@ -171,7 +168,7 @@ impl AdnlClient {
         }
         let answer = deserialize(&buf[..])?
             .downcast::<AdnlMessage>()
-            .map_err(|answer| failure::format_err!("Unsupported ADNL message {:?}", answer))?;
+            .map_err(|answer| error!("Unsupported ADNL message {:?}", answer))?;
         match answer {
             AdnlMessage::Adnl_Message_Answer(answer) => if &query_id == get256(&answer.query_id) {
                 deserialize(&answer.answer)
@@ -188,15 +185,14 @@ impl AdnlClient {
     ) -> Result<AdnlStreamCrypto> {
         let mut rng = rand::thread_rng();
         let mut buf: Vec<u8> = (0..160).map(|_| rng.gen()).collect();
-        let nonce = arrayref::array_ref!(buf, 0, 160);
-        dump!(trace, TARGET, "Nonce", nonce);
+        let nonce = buf.as_slice().try_into()?;
         let ret = AdnlStreamCrypto::with_nonce_as_client(nonce);
         if let Some(client_key) = &config.client_key {
             AdnlHandshake::build_packet(&mut buf, client_key, &config.server_key)?
         } else {
             AdnlHandshake::build_packet(
                 &mut buf, 
-                &KeyOption::from_ed25519_secret_key(ed25519_dalek::SecretKey::generate(&mut rng)),
+                &KeyOption::from_ed25519_secret_key(ed25519_dalek::SecretKey::generate(&mut rng))?,
                 &config.server_key
             )?
         }

@@ -4,7 +4,7 @@ use ed25519::signature::{Signature, Verifier};
 use rand::Rng;
 use sha2::Digest;
 use std::{
-    fmt::{self, Debug, Display, Formatter}, hash::Hash,
+    convert::TryInto, fmt::{self, Debug, Display, Formatter}, hash::Hash,
     sync::{Arc, atomic::{AtomicU64, AtomicUsize, Ordering}},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH}
 };
@@ -28,7 +28,7 @@ use ton_api::{
 };
 use ton_types::{fail, Result};
 
-#[cfg(any(feature = "client", feature = "node", feature = "server"))]
+#[cfg(any(feature = "node", feature = "server"))]
 pub(crate) const TARGET: &str = "adnl";
 
 #[macro_export]
@@ -61,35 +61,6 @@ macro_rules! dump {
 }
 
 #[macro_export]
-macro_rules! from_slice {
-    ($x:ident, 32) => {
-         [ 
-             $x[ 0], $x[ 1], $x[ 2], $x[ 3], $x[ 4], $x[ 5], $x[ 6], $x[ 7], $x[ 8], $x[ 9], 
-             $x[10], $x[11], $x[12], $x[13], $x[14], $x[15], $x[16], $x[17], $x[18], $x[19], 
-             $x[20], $x[21], $x[22], $x[23], $x[24], $x[25], $x[26], $x[27], $x[28], $x[29], 
-             $x[30], $x[31]
-         ]
-    };
-    ($x:ident, $ix:expr, 16, $y: ident, $iy:expr, 16) => {
-         [ 
-             $x[$ix +  0], $x[$ix +  1], $x[$ix +  2], $x[$ix +  3], $x[$ix +  4], $x[$ix +  5], 
-             $x[$ix +  6], $x[$ix +  7], $x[$ix +  8], $x[$ix +  9], $x[$ix + 10], $x[$ix + 11], 
-             $x[$ix + 12], $x[$ix + 13], $x[$ix + 14], $x[$ix + 15], 
-             $y[$iy +  0], $y[$iy +  1], $y[$iy +  2], $y[$iy +  3], $y[$iy +  4], $y[$iy +  5], 
-             $y[$iy +  6], $y[$iy +  7], $y[$iy +  8], $y[$iy +  9], $y[$iy + 10], $y[$iy + 11], 
-             $y[$iy + 12], $y[$iy + 13], $y[$iy + 14], $y[$iy + 15], 
-         ]
-    };
-    ($x:ident, $ix:expr, 4, $y: ident, $iy:expr, 12) => {
-         [ 
-             $x[$ix +  0], $x[$ix +  1], $x[$ix +  2], $x[$ix +  3], 
-             $y[$iy +  0], $y[$iy +  1], $y[$iy +  2], $y[$iy +  3], $y[$iy +  4], $y[$iy +  5], 
-             $y[$iy +  6], $y[$iy +  7], $y[$iy +  8], $y[$iy +  9], $y[$iy + 10], $y[$iy + 11], 
-         ]
-    }
-}
-
-#[macro_export]
 macro_rules! trace {
     ($target:expr, $func:expr) => {
         {
@@ -113,12 +84,35 @@ pub struct AdnlCryptoUtils;
 impl AdnlCryptoUtils {
 
     /// Build AES-based cipher with clearing key data
+    pub fn build_cipher_secure(secret: &[u8; 32], digest: &[u8; 32]) -> aes_ctr::Aes256Ctr {
+        let x = secret;
+        let y = digest;
+        // let mut key = from_slice!(x, 0, 16, y, 16, 16);
+        let mut key = [
+            x[ 0], x[ 1], x[ 2], x[ 3], x[ 4], x[ 5], x[ 6], x[ 7],
+            x[ 8], x[ 9], x[10], x[11], x[12], x[13], x[14], x[15],
+            y[16], y[17], y[18], y[19], y[20], y[21], y[22], y[23],
+            y[24], y[25], y[26], y[27], y[28], y[29], y[30], y[31]
+        ];
+        // let mut ctr = from_slice!(y, 0,  4, x, 20, 12);
+        let mut ctr = [
+            y[ 0], y[ 1], y[ 2], y[ 3], x[20], x[21], x[22], x[23],
+            x[24], x[25], x[26], x[27], x[28], x[29], x[30], x[31]
+        ];
+        let ret = Self::build_cipher_internal(&key, &ctr);
+        key.iter_mut().for_each(|a| *a = 0);
+        ctr.iter_mut().for_each(|a| *a = 0);
+        ret
+    }
+
+/*
     pub fn build_cipher_secure(key: &mut [u8], ctr: &mut [u8]) -> aes_ctr::Aes256Ctr {
         let ret = Self::build_cipher_internal(key, ctr);
         key.iter_mut().for_each(|a| *a = 0);
         ctr.iter_mut().for_each(|a| *a = 0);
         ret
     }
+*/
 
     /// Build AES-based cipher without clearing key data
     pub fn build_cipher_unsecure(
@@ -160,28 +154,22 @@ impl AdnlHandshake {
         local: &KeyOption, 
         other: &KeyOption
     ) -> Result<()> {
-
-        let checksum = {
-            let checksum = sha2::Sha256::digest(&buf[..]);
-            let checksum = checksum.as_slice();
-            from_slice!(checksum, 32)
-        };
-
+        let checksum = sha2::Sha256::digest(buf);
         let len = buf.len();
         buf.resize(len + 96, 0);
         buf[..].copy_within(..len, 96);                                                         
         buf[..32].copy_from_slice(other.id().data());
         buf[32..64].copy_from_slice(local.pub_key()?);
         buf[64..96].copy_from_slice(&checksum);
-
         let mut shared_secret = AdnlCryptoUtils::calc_shared_secret(
             local.pvt_key()?, 
             other.pub_key()?
         );
-        Self::build_packet_cipher(&mut shared_secret, &checksum)
-            .apply_keystream(&mut buf[96..]);
+        Self::build_packet_cipher(
+            &mut shared_secret, 
+            checksum.as_slice().try_into()?
+        ).apply_keystream(&mut buf[96..]);
         Ok(())
-
     }
 
     /// Parse handshake packet
@@ -198,15 +186,17 @@ impl AdnlHandshake {
             if key.val().id().data().eq(&buf[0..32]) {
                 let mut shared_secret = AdnlCryptoUtils::calc_shared_secret(
                     key.val().pvt_key()?, 
-                    arrayref::array_ref!(buf, 32, 32)
+                    buf[32..64].try_into()?
                 );
                 let range = if let Some(len) = len {
                     96..96 + len
                 } else {
                     96..buf.len()
                 };
-                Self::build_packet_cipher(&mut shared_secret, arrayref::array_ref!(buf, 64, 32))
-                    .apply_keystream(&mut buf[range]);
+                Self::build_packet_cipher(
+                    &mut shared_secret,
+                    buf[64..96].try_into()?
+                ).apply_keystream(&mut buf[range]);
                 if !sha2::Sha256::digest(&buf[96..]).as_slice().eq(&buf[64..96]) {
                     fail!("Bad handshake packet checksum");
                 }
@@ -217,17 +207,30 @@ impl AdnlHandshake {
         Ok(None)
     }
 
-    #[cfg(any(feature = "client", feature = "server", feature = "node"))]
+    #[cfg(any(feature = "client", feature = "node", feature = "server"))]
     fn build_packet_cipher(
         shared_secret: &mut [u8; 32], 
         checksum: &[u8; 32]
-    ) -> aes_ctr::Aes256Ctr {
-        let x = &shared_secret[..];
-        let y = &checksum[..];
-        let mut aes_key_bytes = from_slice!(x, 0, 16, y, 16, 16);
-        let mut aes_ctr_bytes = from_slice!(y, 0,  4, x, 20, 12);
+    )  -> aes_ctr::Aes256Ctr {
+/*
+        let x = shared_secret;
+        let y = checksum;
+        //let mut aes_key_bytes = from_slice!(x, 0, 16, y, 16, 16);
+        let mut aes_key_bytes = [
+            x[ 0], x[ 1], x[ 2], x[ 3], x[ 4], x[ 5], x[ 6], x[ 7],
+            x[ 8], x[ 9], x[10], x[11], x[12], x[13], x[14], x[15],
+            y[16], y[17], y[18], y[19], y[20], y[21], y[22], y[23],
+            y[24], y[25], y[26], y[27], y[28], y[29], y[30], y[31]
+        ];
+        //let mut aes_ctr_bytes = from_slice!(y, 0,  4, x, 20, 12);
+        let mut aes_ctr_bytes = [
+            y[ 0], y[ 1], y[ 2], y[ 3], x[20], x[21], x[22], x[23],
+            x[24], x[25], x[26], x[27], x[28], x[29], x[30], x[31]
+        ];
+*/
+        let ret = AdnlCryptoUtils::build_cipher_secure(shared_secret, checksum);
         shared_secret.iter_mut().for_each(|a| *a = 0);
-        AdnlCryptoUtils::build_cipher_secure(&mut aes_key_bytes, &mut aes_ctr_bytes)
+        ret
     }
 
 }
@@ -293,8 +296,8 @@ impl AdnlStream {
     /// Constructor
     pub fn from_stream_with_timeouts(stream: tokio::net::TcpStream, timeouts: &Timeouts) -> Self {
         let mut stream = tokio_io_timeout::TimeoutStream::new(stream);
-        stream.set_write_timeout(timeouts.write());
-        stream.set_read_timeout(timeouts.read());
+        stream.set_write_timeout(Some(timeouts.write()));
+        stream.set_read_timeout(Some(timeouts.read()));
         Self(stream)
     }
     /// Read from stream
@@ -357,7 +360,7 @@ impl AdnlStreamCrypto {
         buf.resize(len + 36, 0);
         buf[..].copy_within(..len, 36);
         buf[..4].copy_from_slice(&((len + 64) as u32).to_le_bytes());
-        buf[4..36].copy_from_slice(&nonce);   
+        buf[4..36].copy_from_slice(&nonce);
         buf.extend_from_slice(sha2::Sha256::digest(&buf[4..]).as_slice());
         self.cipher_send.apply_keystream(&mut buf[..]);      
         stream.write(buf).await?;
@@ -477,22 +480,21 @@ impl KeyOption {
     pub const KEY_ED25519: i32 = 1209251014;
 
     /// Create from Ed25519 expanded secret key
-    pub fn from_ed25519_expanded_secret_key(exp_key: ed25519_dalek::ExpandedSecretKey) -> Self {
+    pub fn from_ed25519_expanded_secret_key(exp_key: ed25519_dalek::ExpandedSecretKey) -> Result<Self> {
         let pub_key = ed25519_dalek::PublicKey::from(&exp_key).to_bytes();
-        let exp_key = &exp_key.to_bytes();
-        let pvt_key = &exp_key[..32];
-        let pvt_key = from_slice!(pvt_key, 32);
-        let exp_key = &exp_key[32..];
-        let exp_key = from_slice!(exp_key, 32);
-        Self {
+        let exp_key = exp_key.to_bytes();
+        let pvt_key = exp_key[..32].try_into()?;
+        let exp_key = exp_key[32..64].try_into()?;
+        let ret = Self {
             id: Self::calc_id(Self::KEY_ED25519, &pub_key), 
             keys: [Some(pub_key), Some(pvt_key), Some(exp_key)],
             type_id: Self::KEY_ED25519
-        }
+        };
+        Ok(ret)
     }
 
     /// Create from Ed25519 secret key
-    pub fn from_ed25519_secret_key(key: ed25519_dalek::SecretKey) -> Self {
+    pub fn from_ed25519_secret_key(key: ed25519_dalek::SecretKey) -> Result<Self> {
         Self::from_ed25519_expanded_secret_key(ed25519_dalek::ExpandedSecretKey::from(&key))
     }
 
@@ -501,19 +503,21 @@ impl KeyOption {
         if src.pub_key.is_some() {
             fail!("No public key expected");
         };
-        let key = if let Some(key) = &src.pvt_key {
-            base64::decode(key)?
-        } else {
-            fail!("No private key");
-        };
-        if key.len() != 32 {
-            fail!("Bad private key");
-        } 
-        if src.type_id == Self::KEY_ED25519 {
-            let sec_key = ed25519_dalek::SecretKey::from_bytes(&key[..32])?;
-            Ok(Self::from_ed25519_secret_key(sec_key))
-        } else {
-            fail!("Type-id {} is not supported for private key", src.type_id);
+        match src.type_id {
+            Self::KEY_ED25519 => match &src.pvt_key {
+                Some(key) => {
+                    let key = base64::decode(key)?;
+                    if key.len() != 32 {
+                        fail!("Bad private key");
+                    } 
+                    let sec_key = ed25519_dalek::SecretKey::from_bytes(
+                        key.as_slice().try_into()?
+                    )?;
+                    Self::from_ed25519_secret_key(sec_key)
+                }
+                None => fail!("No private key")
+            }
+            _ => fail!("Type-id {} is not supported for private key", src.type_id)
         }
     }
 
@@ -522,23 +526,22 @@ impl KeyOption {
         if src.pvt_key.is_some() {
             fail!("No private key expected");
         };
-        let key = if let Some(key) = &src.pub_key {
-            base64::decode(key)?
-        } else {
-            fail!("No public key");
-        };
-        if key.len() != 32 {
-            fail!("Bad public key");
-        } 
-        let key = &key[..32];
-        let pub_key = from_slice!(key, 32);
-        Ok(
-            Self {
-                id: Self::calc_id(src.type_id, &pub_key), 
-                keys: [Some(pub_key), None, None],
-                type_id: src.type_id
+        match &src.pub_key {
+            Some(key) => {
+                let key = base64::decode(key)?;
+                if key.len() != 32 {
+                    fail!("Bad public key");
+                } 
+                let pub_key: [u8; 32] = key.as_slice().try_into()?;
+                let ret = Self {
+                    id: Self::calc_id(src.type_id, &pub_key),
+                    keys: [Some(pub_key), None, None],
+                    type_id: src.type_id
+                };
+                Ok(ret)
             }
-        )
+            None => fail!("No public key")
+        }
     }
 
     /// Create from TL object with public key 
@@ -552,10 +555,10 @@ impl KeyOption {
 
     /// Create from TL serialized public key 
     pub fn from_tl_serialized_public_key(src: &[u8]) -> Result<Self> {
-        let pub_key = deserialize(src)?
-            .downcast::<ton::PublicKey>()
-            .map_err(|key| failure::format_err!("Unsupported PublicKey data {:?}", key))?;
-        Self::from_tl_public_key(&pub_key)
+        match deserialize(src)?.downcast::<ton::PublicKey>() {
+            Ok(pub_key) => Self::from_tl_public_key(&pub_key),
+            Err(key) => fail!("Unsupported PublicKey data {:?}", key)
+        }
     }
 
     /// Create from type and private key 
@@ -572,7 +575,7 @@ impl KeyOption {
             pub_key: None,
             pvt_key: Some(base64::encode(pvt_key))
         };
-        Ok((json, Self::from_ed25519_secret_key(sec_key)))
+        Ok((json, Self::from_ed25519_secret_key(sec_key)?))
     }
 
     /// Create from type and public key 
@@ -595,7 +598,7 @@ impl KeyOption {
             pub_key: None,
             pvt_key: Some(base64::encode(&sec_key.to_bytes()))
         };
-        Ok((json, Self::from_ed25519_secret_key(sec_key)))
+        Ok((json, Self::from_ed25519_secret_key(sec_key)?))
     }
 
     /// Get key id 
@@ -675,11 +678,9 @@ impl KeyOption {
     /// Calculate key ID
     fn calc_id(type_id: i32, pub_key: &[u8; 32]) -> Arc<KeyId> {
         let mut sha = sha2::Sha256::new();
-        sha.input(&type_id.to_le_bytes());
-        sha.input(pub_key);    
-        let buf = sha.result_reset();      
-        let src = buf.as_slice();         
-        KeyId::from_data(from_slice!(src, 32))
+        sha.update(&type_id.to_le_bytes());
+        sha.update(pub_key);
+        KeyId::from_data(sha.finalize().into())
     }
 
 }
@@ -938,6 +939,7 @@ pub struct TaggedObject<T> {
     #[cfg(feature = "telemetry")]
     pub tag: u32 
 }
+
 pub type TaggedAdnlMessage = TaggedObject<AdnlMessage>;
 pub type TaggedByteSlice<'a> = TaggedObject<&'a[u8]>;
 pub type TaggedByteVec = TaggedObject<Vec<u8>>;
@@ -954,12 +956,12 @@ pub struct Timeouts {
 impl Timeouts {
     pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
     /// Read timeout
-    pub fn read(&self) -> Option<Duration> {
-        Some(self.read)
+    pub fn read(&self) -> Duration {
+        self.read
     }
     /// Write timeout
-    pub fn write(&self) -> Option<Duration> {
-        Some(self.write)
+    pub fn write(&self) -> Duration {
+        self.write
     }
 }
 
@@ -1173,9 +1175,7 @@ pub fn hash<T: IntoBoxed>(object: T) -> Result<[u8; 32]> {
 /// Calculate hash of TL object, boxed option
 pub fn hash_boxed<T: BoxedSerialize>(object: &T) -> Result<[u8; 32]> {
     let data = serialize(object)?;
-    let buf = sha2::Sha256::digest(&data[..]);
-    let hash = buf.as_slice();
-    Ok(from_slice!(hash, 32))
+    Ok(sha2::Sha256::digest(&data).into())
 }
 
 /// Serialize TL object into bytes
@@ -1198,14 +1198,14 @@ pub fn serialize_inplace<T: BoxedSerialize>(buf: &mut Vec<u8>, object: &T) -> Re
 }
 
 /// Serialize TL object into bytes
-pub fn serialize_boxed<T: BareSerialize>(object: &T) -> Result<Vec<u8>> {
+pub fn serialize_unboxed<T: BareSerialize>(object: &T) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     Serializer::new(&mut buf).write_into_boxed(object)?;
     Ok(buf)
 }
 
 /// Serialize TL object into bytes in-place
-pub fn serialize_boxed_inplace<T: BareSerialize>(buf: &mut Vec<u8>, object: &T) -> Result<()> {
+pub fn serialize_unboxed_inplace<T: BareSerialize>(buf: &mut Vec<u8>, object: &T) -> Result<()> {
     buf.truncate(0);
     Serializer::new(buf).write_into_boxed(object)
 }
