@@ -1,8 +1,8 @@
 use crate::{
-    declare_counted, from_slice, 
+    declare_counted, 
     common::{
         add_counted_object_to_map, add_counted_object_to_map_with_update, 
-        add_unbound_object_to_map, add_unbound_object_to_map_with_update, 
+        add_unbound_object_to_map, add_unbound_object_to_map_with_update,
         AdnlCryptoUtils, AdnlHandshake, AdnlPeers, AdnlPingSubscriber, deserialize, get256, 
         hash, CountedObject, Counter, KeyId, KeyOption, KeyOptionJson, Query, QueryCache, 
         QueryId, serialize, Subscriber, TARGET, TaggedAdnlMessage, TaggedByteSlice, 
@@ -20,7 +20,7 @@ use sha2::Digest;
 use socket2::{Domain, SockAddr, Socket, Type};
 use std::{
     cmp::{max, min, Ordering}, collections::VecDeque, fmt::{self, Debug, Display, Formatter}, 
-    io::ErrorKind, net::{IpAddr, Ipv4Addr, SocketAddr}, 
+    convert::TryInto, io::ErrorKind, net::{IpAddr, Ipv4Addr, SocketAddr}, 
     sync::{Arc, Condvar, Mutex, atomic::{self, AtomicI32, AtomicU32, AtomicU64, AtomicUsize}},
     time::{Duration, Instant}, thread
 };
@@ -396,7 +396,7 @@ impl AdnlChannel {
         if buf.len() < 64 {
             fail!("Channel message is too short: {}", buf.len())
         }
-        Self::process_data(buf, &side.secret);
+        Self::process_data(buf, &side.secret)?;
         if !sha2::Sha256::digest(&buf[64..]).as_slice().eq(&buf[32..64]) {
             fail!("Bad channel message checksum");
         }
@@ -413,18 +413,13 @@ impl AdnlChannel {
     }
 
     fn encrypt(buf: &mut Vec<u8>, side: &SubchannelSide) -> Result<()> {
-        let checksum = {
-            let checksum = sha2::Sha256::digest(&buf[..]);
-            let checksum = checksum.as_slice();
-            from_slice!(checksum, 32)
-        };
+        let checksum = sha2::Sha256::digest(buf);
         let len = buf.len();
         buf.resize(len + 64, 0);
-        buf[..].copy_within(..len, 64);                                                         
+        buf[..].copy_within(..len, 64);
         buf[..32].copy_from_slice(&side.id);
-        buf[32..64].copy_from_slice(&checksum[..]);
-        Self::process_data(buf, &side.secret);
-        Ok(())
+        buf[32..64].copy_from_slice(&checksum);
+        Self::process_data(buf, &side.secret)
     }
 
     fn encrypt_ordinary(&self, buf: &mut Vec<u8>) -> Result<()> { 
@@ -447,14 +442,14 @@ impl AdnlChannel {
         &self.recv.priority.id
     }
 
-    fn process_data(buf: &mut Vec<u8>, secret: &[u8; 32]) {
-        let digest = &buf[32..64];
-        let mut key = from_slice!(secret, 0, 16, digest, 16, 16);
-        let mut ctr = from_slice!(digest, 0,  4, secret, 20, 12);
-        AdnlCryptoUtils::build_cipher_secure(&mut key[..], &mut ctr[..])
-            .apply_keystream(&mut buf[64..]);
+    fn process_data(buf: &mut Vec<u8>, secret: &[u8; 32]) -> Result<()> {
+        AdnlCryptoUtils::build_cipher_secure(
+            secret, 
+            buf[32..64].try_into()?
+        ).apply_keystream(&mut buf[64..]);
+        Ok(())
     }
-  
+
 }
 
 struct AdnlNodeAddress {
@@ -1269,6 +1264,25 @@ impl PeerState {
 
 }
 
+struct Peers {
+    channels_send: Arc<ChannelsSend>,
+    channels_wait: Arc<ChannelsSend>,
+    map_of: lockfree::map::Map<Arc<KeyId>, Peer>
+}
+
+impl Peers {
+    fn with_incinerator(
+        incinerator: &lockfree::map::SharedIncin<Arc<KeyId>, Arc<AdnlChannel>>
+    ) -> Arc<Self> {
+        let ret = Peers {
+            map_of: lockfree::map::Map::new(),
+            channels_send: Arc::new(lockfree::map::Map::with_incin(incinerator.clone())),
+            channels_wait: Arc::new(lockfree::map::Map::with_incin(incinerator.clone()))
+        };
+        Arc::new(ret)
+    }
+}
+
 struct Queue<T> {
     queue: lockfree::queue::Queue<T>,
     #[cfg(feature = "telemetry")]
@@ -1631,7 +1645,6 @@ declare_counted!(
 type ChannelId = [u8; 32];
 type ChannelsRecv = lockfree::map::Map<ChannelId, Subchannel>; 
 type ChannelsSend = lockfree::map::Map<Arc<KeyId>, Arc<AdnlChannel>>;
-type Peers = lockfree::map::Map<Arc<KeyId>, Peer>;
 type TransferId = [u8; 32];
 
 #[cfg(feature = "telemetry")]
@@ -1833,9 +1846,8 @@ struct AdnlAlloc {
 
 /// ADNL node
 pub struct AdnlNode {
+    channels_incinerator: lockfree::map::SharedIncin<Arc<KeyId>, Arc<AdnlChannel>>,
     channels_recv: Arc<ChannelsRecv>,
-    channels_send: Arc<ChannelsSend>,
-    channels_wait: Arc<ChannelsSend>,
     config: AdnlNodeConfig,
     peers: lockfree::map::Map<Arc<KeyId>, Arc<Peers>>,
     queries: Arc<QueryCache>, 
@@ -1867,10 +1879,11 @@ impl AdnlNode {
     
     /// Constructor
     pub async fn with_config(mut config: AdnlNodeConfig) -> Result<Arc<Self>> {
+        let incinerator = lockfree::map::SharedIncin::new();
         let peers = lockfree::map::Map::new();
         let mut added = false;
         for key in config.keys.iter() {
-            peers.insert(key.val().id().clone(), Arc::new(lockfree::map::Map::new()));
+            peers.insert(key.val().id().clone(), Peers::with_incinerator(&incinerator));
             added = true
         }
         if !added {
@@ -1889,7 +1902,6 @@ impl AdnlNode {
         }
         let (queue_send_loopback_sender, queue_send_loopback_reader) = 
             tokio::sync::mpsc::unbounded_channel();
-        let incinerator = lockfree::map::SharedIncin::new();
         #[cfg(feature = "telemetry")] 
         let telemetry = {
             let ordinary = TelemetryByStage::with_priority(false);
@@ -1949,9 +1961,8 @@ impl AdnlNode {
             transfers: Arc::new(AtomicU64::new(0))
         };
         let ret = Self {
+            channels_incinerator: incinerator, 
             channels_recv: Arc::new(lockfree::map::Map::new()), 
-            channels_send: Arc::new(lockfree::map::Map::with_incin(incinerator.clone())),
-            channels_wait: Arc::new(lockfree::map::Map::with_incin(incinerator)),
             config, 
             peers,
             queries: Arc::new(lockfree::map::Map::new()), 
@@ -2333,7 +2344,7 @@ impl AdnlNode {
         add_unbound_object_to_map(
             &self.peers,
             ret.clone(),
-            || Ok(Arc::new(lockfree::map::Map::new()))
+            || Ok(Peers::with_incinerator(&self.channels_incinerator))
         )?;
         Ok(ret)
     }
@@ -2359,7 +2370,7 @@ impl AdnlNode {
         let IpAddress(peer_ip_address) = peer_ip_address;
         let mut error = None;
         let mut ret = peer_key.id().clone();
-        let result = self.peers(local_key)?.insert_with(
+        let result = self.peers(local_key)?.map_of.insert_with(
             ret.clone(), 
             |key, inserted, found| if let Some((_, found)) = found {
                 ret = key.clone();
@@ -2459,7 +2470,7 @@ impl AdnlNode {
         let peers = self.peers.get(local_key).ok_or_else(
             || error!("Try to remove peer {} from unknown local key {}", peer_key, local_key)
         )?;
-        Ok(peers.val().remove(peer_key).is_some())
+        Ok(peers.val().map_of.remove(peer_key).is_some())
     }
 
     /// Node IP address
@@ -2647,20 +2658,22 @@ impl AdnlNode {
     }
 
     /// Reset peers 
-    pub fn reset_peers(&self, peers: &AdnlPeers) -> Result<()> {
-        let peer_list = self.peers(peers.local())?;
-        let peer = peer_list.get(peers.other()).ok_or_else(
-            || error!("Try to reset unknown peer pair {} -> {}", peers.local(), peers.other())
+    pub fn reset_peers(&self, to_reset: &AdnlPeers) -> Result<()> {
+        let local_key = to_reset.local();
+        let other_key = to_reset.other();
+        let peers = self.peers(local_key)?;
+        let peer = peers.map_of.get(other_key).ok_or_else(
+            || error!("Try to reset unknown peer pair {} -> {}", local_key, other_key)
         )?;
-        log::warn!(target: TARGET, "Resetting peer pair {} -> {}", peers.local(), peers.other());
+        log::warn!(target: TARGET, "Resetting peer pair {} -> {}", local_key, other_key);
         let peer = peer.val();
         let address = AdnlNodeAddress::from_ip_address_and_key(
             IpAddress(peer.address.ip_address.load(atomic::Ordering::Relaxed)),
             peer.address.key.clone()        
         )?;
-        self.channels_wait
-            .remove(peers.other())
-            .or_else(|| self.channels_send.remove(peers.other()))
+        peers.channels_wait
+            .remove(other_key)
+            .or_else(|| peers.channels_send.remove(other_key))
             .and_then(
                 |removed| {
                     let peer = Peer {
@@ -2670,13 +2683,13 @@ impl AdnlNode {
                             #[cfg(feature = "telemetry")]
                             self, 
                             #[cfg(feature = "telemetry")]
-                            peers
+                            to_reset
                         ),
                         send_state: PeerState::for_send(
                             #[cfg(feature = "telemetry")]
                             self, 
                             #[cfg(feature = "telemetry")]
-                            peers
+                            to_reset
                         ),
                         counter: self.allocated.peers.clone().into()
                     };
@@ -2684,7 +2697,7 @@ impl AdnlNode {
                     self.telemetry.allocated.peers.update(
                         self.allocated.peers.load(atomic::Ordering::Relaxed)
                     );
-                    peer_list.insert(peers.other().clone(), peer);
+                    peers.map_of.insert(other_key.clone(), peer);
                     self.drop_receive_subchannels(removed.val())
                 }
              );
@@ -2704,22 +2717,23 @@ impl AdnlNode {
             #[cfg(feature = "telemetry")]
             tag: data.tag
         };
-        match self.send_message_to_peer(msg, &peers, false)? {
+        let (_, repeat) = self.send_message_to_peer(msg, &peers, false)?;
+        match repeat {
             MessageRepeat::Unapplicable => Ok(()), 
             x => fail!("INTERNAL ERROR: bad repeat {:?} in ADNL custom message", x)
         }
     }
 
     async fn add_subchannels(&self, channel: Arc<AdnlChannel>, wait: bool) -> Result<()> {
-        let peer = self.peers(&channel.local_key)?;
-        let peer = peer.get(&channel.other_key).ok_or_else(
+        let peers = self.peers(&channel.local_key)?;
+        let peer = peers.map_of.get(&channel.other_key).ok_or_else(
             || error!("Cannot add subchannels to unknown peer {}", channel.other_key)
         )?;
         let peer = peer.val();
         let added = if wait {
             let mut prev = None;
             let added = add_counted_object_to_map_with_update(
-                &self.channels_wait,
+                &peers.channels_wait,
                 channel.other_key.clone(),
                 |found| {
                     prev = if let Some(found) = found {
@@ -2735,7 +2749,7 @@ impl AdnlNode {
             )?;
             if added {
                 prev.or_else(
-                    || if let Some(removed) = self.channels_send.remove(&channel .other_key) {
+                    || if let Some(removed) = peers.channels_send.remove(&channel.other_key) {
                         Some(removed.val().clone())
                     } else {
                         None
@@ -2747,7 +2761,7 @@ impl AdnlNode {
             added
         } else {
             add_counted_object_to_map_with_update(
-                &self.channels_send,
+                &peers.channels_send,
                 channel.other_key.clone(),
                 |found| {
                     if let Some(found) = found {
@@ -2761,9 +2775,9 @@ impl AdnlNode {
         };
         if !added {
             let ch = if wait {
-                self.channels_wait.get(&channel.other_key)
+                peers.channels_wait.get(&channel.other_key)
             } else {
-                self.channels_send.get(&channel.other_key)
+                peers.channels_send.get(&channel.other_key)
             };
             if let Some(ch) = ch {
                 let ch = ch.val();
@@ -2830,15 +2844,15 @@ impl AdnlNode {
         if dst_reinit_date.is_some() != reinit_date.is_some() {
             fail!("Destination and source reinit dates mismatch")
         }
-        let peer = self.peers(&local_key)?;
+        let peers = self.peers(&local_key)?;
         let peer = if other_key.is_some() {
-            if let Some(channel) = self.channels_send.get(&ret) {
-                peer.get(&channel.val().other_key)
+            if let Some(channel) = peers.channels_send.get(&ret) {
+                peers.map_of.get(&channel.val().other_key)
             } else {
                 fail!("Unknown channel, ID {:x?}", ret)
             }
         } else {
-            peer.get(&ret) 
+            peers.map_of.get(&ret) 
         };
         let peer = if let Some(peer) = peer {
             peer
@@ -2932,7 +2946,7 @@ impl AdnlNode {
         let local_key = peers.local();
         let other_key = peers.other();
         let peer = self.peers(local_key)?; 
-        let peer = if let Some(peer) = peer.get(other_key) {
+        let peer = if let Some(peer) = peer.map_of.get(other_key) {
             peer
         } else {
             fail!("Channel {} with unknown peer {} -> {}", context, local_key, other_key)
@@ -2985,8 +2999,9 @@ impl AdnlNode {
         }
         // Ensure both sides of channel established
         if channel.flags.load(atomic::Ordering::Relaxed) & AdnlChannel::ESTABLISHED == 0 {
-            if let Some(removed) = self.channels_wait.remove(&channel.other_key) {
-                let result = self.channels_send.reinsert(removed);
+            let peers = self.peers(&channel.local_key)?;
+            if let Some(removed) = peers.channels_wait.remove(&channel.other_key) {
+                let result = peers.channels_send.reinsert(removed);
                 if let lockfree::map::Insertion::Failed(_) = result {
                     fail!("Internal error when register send channel");
                 }
@@ -3166,7 +3181,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
             _ => fail!("Unsupported ADNL message {:?}", msg)
         };
         if let Some(msg) = msg {
-            let repeat = self.send_message_to_peer(msg, peers, priority)?;
+            let (_, repeat) = self.send_message_to_peer(msg, peers, priority)?;
             if priority {
                 if let MessageRepeat::NotNeeded = &repeat {
                     return Ok(())
@@ -3292,7 +3307,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
         };
         let pkt = deserialize(&packet.buf[..])?
             .downcast::<AdnlPacketContentsBoxed>()
-            .map_err(|pkt| failure::format_err!("Unsupported ADNL packet format {:?}", pkt))?
+            .map_err(|pkt| error!("Unsupported ADNL packet format {:?}", pkt))?
             .only();
         let other_key = if let Some(key) = self.check_packet(
             &pkt, 
@@ -3312,7 +3327,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
         };
         let peers = Arc::new(AdnlPeers::with_keys(local_key, other_key));
         #[cfg(feature = "telemetry")]
-        if let Some(peer) = self.peers(peers.local())?.get(peers.other()) {
+        if let Some(peer) = self.peers(peers.local())?.map_of.get(peers.other()) {
             peer.val().update_recv_stats(received_len as u64, peers.local())
         }
         if let Some(msg) = pkt.message { 
@@ -3380,8 +3395,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
             self.queue_send_loopback_packets.send((msg.object, peers.local().clone()))?;
             (None, MessageRepeat::Unapplicable)
         } else {
-            let channel = self.channels_send.get(peers.other()).map(|guard| guard.val().clone());
-            (channel, self.send_message_to_peer(msg, &peers, priority)?)
+            self.send_message_to_peer(msg, &peers, priority)?
         };
         self.queue_monitor_queries.push(
             (timeout.unwrap_or(Self::TIMEOUT_QUERY_MAX_MS), query_id)
@@ -3400,7 +3414,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
         msg: TaggedAdnlMessage, 
         peers: &AdnlPeers, 
         priority: bool
-    ) -> Result<MessageRepeat> {
+    ) -> Result<(Option<Arc<AdnlChannel>>, MessageRepeat)> {
 
         const SIZE_ANSWER_MSG: usize          = 44;
         const SIZE_CONFIRM_CHANNEL_MSG: usize = 72;
@@ -3430,17 +3444,18 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
 
         log::trace!(target: TARGET, "Send message {:?}", msg.object);
 
-        let peer = self.peers(peers.local())?;
-        let peer = if let Some(peer) = peer.get(peers.other()) {
-            peer
-        } else {
-            fail!("Unknown peer {}", peers.other())
-        };
-        let peer = peer.val();
         let src = self.key_by_id(peers.local())?;
         let dst = peers.other();
-        let channel = self.channels_send.get(dst);
-        let create_channel_msg = if channel.is_none() && self.channels_wait.get(dst).is_none() {
+        let peers = self.peers(peers.local())?;
+        let peer = if let Some(peer) = peers.map_of.get(dst) {
+            peer
+        } else {
+            fail!("Unknown peer {}", dst)
+        };
+        let peer = peer.val();
+        let channel = peers.channels_send.get(dst).map(|guard| guard.val().clone());
+
+        let create_channel_msg = if channel.is_none() && peers.channels_wait.get(dst).is_none() {
             log::debug!(target: TARGET, "Create channel {} -> {}", src.id(), dst);
             Some(
                 CreateChannel {
@@ -3464,53 +3479,48 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
             AdnlMessage::Adnl_Message_Query(query) => query.query.len() + SIZE_QUERY_MSG,
             _ => fail!("Unexpected message to send {:?}", msg.object)  
         };
-        let channel = if let Some(ref channel) = channel {
-            Some(channel.val())
-        } else {
-            None
-        };
 
-        if size <= Self::MAX_ADNL_MESSAGE {
+        let repeat = if size <= Self::MAX_ADNL_MESSAGE {
             if let Some(create_channel_msg) = create_channel_msg {
                 log::trace!(target: TARGET, "Send with message {:?}", create_channel_msg);
                 self.send_packet(
                     peer, 
                     &src, 
-                    channel, 
+                    channel.as_ref(), 
                     None, 
                     Some(vec![create_channel_msg, msg.object]),
                     priority,
                     #[cfg(feature = "telemetry")]
                     msg.tag
-                )
+                )?
             } else {
                 self.send_packet(
                     peer, 
                     &src, 
-                    channel, 
+                    channel.as_ref(), 
                     Some(msg.object), 
                     None, 
                     priority,
                     #[cfg(feature = "telemetry")]
                     msg.tag
-                )
+                )?
             }
         } else {
             let data = serialize(&msg.object)?;
             let hash = sha2::Sha256::digest(&data);
-            let hash = arrayref::array_ref!(hash.as_slice(), 0, 32);            
+            let hash: &[u8; 32] = hash.as_slice().try_into()?;
             let mut offset = 0;
             let mut repeat = if let Some(create_channel_msg) = create_channel_msg {
                 let part_msg = build_part_message(
-                    &data[..], 
-                    hash, 
+                    &data[..],
+                    hash,
                     &mut offset, 
                     Self::MAX_ADNL_MESSAGE - SIZE_CREATE_CHANNEL_MSG
                 );
                 self.send_packet(
                     peer, 
                     &src, 
-                    channel, 
+                    channel.as_ref(), 
                     None, 
                     Some(vec![create_channel_msg, part_msg]),
                     priority,
@@ -3523,14 +3533,14 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
             while offset < data.len() {
                 let part_msg = build_part_message(
                     &data[..], 
-                    hash, 
+                    hash,
                     &mut offset, 
                     Self::MAX_ADNL_MESSAGE
                 );
                 let upd = self.send_packet(
                     peer, 
                     &src, 
-                    channel, 
+                    channel.as_ref(), 
                     Some(part_msg), 
                     None, 
                     priority,
@@ -3543,8 +3553,9 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
                     fail!("INTERNAL ERROR: bad repeat in ADNL message part")
                 }
             };
-            Ok(repeat)
-        }
+            repeat
+        };
+        Ok((channel, repeat))
 
     }
 
@@ -3750,8 +3761,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
                     fail!("Invalid ADNL part transfer: parts mismatch")
                 }
             }
-            let hash = sha2::Sha256::digest(&buf);
-            if arrayref::array_ref!(hash.as_slice(), 0, 32) != transfer_id {
+            if !sha2::Sha256::digest(&buf).as_slice().eq(transfer_id) {
                 fail!("Bad hash of ADNL transfer {}", base64::encode(transfer_id))
             }
             let msg = deserialize(&buf)?
