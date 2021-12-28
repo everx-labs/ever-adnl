@@ -16,8 +16,8 @@ use crate::{
     common::{
         add_counted_object_to_map, add_counted_object_to_map_with_update, 
         add_unbound_object_to_map, add_unbound_object_to_map_with_update,
-        AdnlCryptoUtils, AdnlHandshake, AdnlPeers, AdnlPingSubscriber, deserialize, get256, 
-        hash, CountedObject, Counter, KeyId, KeyOption, KeyOptionJson, Query, QueryCache, 
+        AdnlCryptoUtils, AdnlHandshake, AdnlPeers, AdnlPingSubscriber, CountedObject, 
+        Counter, deserialize, hash, KeyId, KeyOption, KeyOptionJson, Query, QueryCache, 
         QueryId, serialize, Subscriber, TARGET, TaggedAdnlMessage, TaggedByteSlice, 
         TaggedTlObject, UpdatedAt, Version
     }
@@ -55,7 +55,7 @@ use ton_api::{
         pub_::publickey::Aes as AesKey
     }
 };
-use ton_types::{error, fail, Result};
+use ton_types::{error, fail, Result, UInt256};
 
 const TARGET_QUERY: &str = "adnl_query";
 
@@ -400,7 +400,7 @@ impl AdnlChannel {
 
     fn calc_id(secret: &[u8; 32]) -> Result<ChannelId> {
         let object = AesKey {
-            key: ton::int256(secret.clone())
+            key: UInt256::with_array(secret.clone())
         };
         hash(object)
     }
@@ -2838,7 +2838,7 @@ impl AdnlNode {
             let key = Arc::new(KeyOption::from_tl_public_key(pub_key)?);
             let other_key = key.id().clone();
             if let Some(id) = &packet.from_short {
-                if other_key.data() != &id.id.0 {
+                if other_key.data() != id.id.as_slice() {
                     fail!("Mismatch between ID and key inside packet")
                 }
             }
@@ -2848,7 +2848,7 @@ impl AdnlNode {
             }
             other_key
         } else if let Some(id) = &packet.from_short {
-            KeyId::from_data(id.id.0)
+            KeyId::from_data(id.id.as_slice().clone())
         } else {
             fail!("No other key data inside packet: {:?}", packet)
         };
@@ -3061,7 +3061,7 @@ impl AdnlNode {
     ) -> Result<()> {
         log::trace!(target: TARGET, "Process message {:?}", msg);
         let new_msg = if let AdnlMessage::Adnl_Message_Part(part) = &msg {
-            let transfer_id = get256(&part.hash);
+            let transfer_id = part.hash.as_slice();
             let added = add_counted_object_to_map(
                 &self.transfers,
                 transfer_id.clone(),
@@ -3132,11 +3132,11 @@ impl AdnlNode {
                 None
             },
             AdnlMessage::Adnl_Message_ConfirmChannel(confirm) => {
-                let mut local_pub = Some(get256(&confirm.peer_key).clone());
+                let mut local_pub = Some(confirm.peer_key.as_slice().clone());
                 let channel = self.create_channel(
                     peers, 
                     &mut local_pub, 
-                    get256(&confirm.key), 
+                    confirm.key.as_slice(), 
                     "confirmation"
                 )?;
                 /*
@@ -3152,12 +3152,12 @@ log::warn!(target: TARGET, "On recv confirm channel in {}", channel.local_key);
                 let channel = self.create_channel(
                     peers, 
                     &mut local_pub, 
-                    get256(&create.key), 
+                    create.key.as_slice(), 
                     "creation"
                 )?;
                 let msg = if let Some(local_pub) = local_pub {
                     ConfirmChannel {
-                        key: ton::int256(local_pub),
+                        key: UInt256::with_array(local_pub),
                         peer_key: create.key,
                         date: create.date
                     }.into_boxed()
@@ -3211,7 +3211,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
     }
 
     async fn process_answer(&self, answer: &AdnlAnswerMessage, src: &Arc<KeyId>) -> Result<()> {
-        let query_id = get256(&answer.query_id).clone();
+        let query_id = answer.query_id.as_slice().clone();
         if !Self::update_query(&self.queries, query_id, Some(&answer.answer)).await? {
             fail!("Received answer from {} to unknown query {:?}", src, answer)
         }
@@ -3223,7 +3223,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
         query: &AdnlQueryMessage,
         peers: &AdnlPeers
     ) -> Result<Option<TaggedAdnlMessage>> {
-        let query_id = &query.query_id;
+        let query_id = query.query_id.as_slice();
         log::info!(
             target: TARGET_QUERY, 
             "Recv query {:02x}{:02x}{:02x}{:02x}", 
@@ -3446,7 +3446,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
             let next = min(data.len(), *offset + max_size);
             part.extend_from_slice(&data[*offset..next]);
             let ret = AdnlPartMessage {
-                hash: ton::int256(hash.clone()),
+                hash: UInt256::with_array(hash.clone()),
                 total_size: data.len() as i32,
                 offset: *offset as i32,
                 data: ton::bytes(part)
@@ -3472,7 +3472,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
             log::debug!(target: TARGET, "Create channel {} -> {}", src.id(), dst);
             Some(
                 CreateChannel {
-                    key: ton::int256(peer.address.channel_key.pub_key()?.clone()),
+                    key: UInt256::with_array(peer.address.channel_key.pub_key()?.clone()),
                     date: Version::get()
                 }.into_boxed()
             )
@@ -3617,7 +3617,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
                 } else {
                     Some(
                         AdnlIdShort {
-                            id: ton::int256(source.id().data().clone())
+                            id: UInt256::with_array(source.id().data().clone())
                         }
                     )
                 }, 

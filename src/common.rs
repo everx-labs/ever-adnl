@@ -39,7 +39,7 @@ use ton_api::{
         rpc::adnl::Ping as AdnlPing
     }
 };
-use ton_types::{fail, Result};
+use ton_types::{fail, Result, UInt256};
 
 #[cfg(any(feature = "node", feature = "server"))]
 pub(crate) const TARGET: &str = "adnl";
@@ -560,7 +560,7 @@ impl KeyOption {
     /// Create from TL object with public key 
     pub fn from_tl_public_key(src: &ton::PublicKey) -> Result<Self> {
         if let ton::PublicKey::Pub_Ed25519(key) = src {
-            Ok(Self::from_type_and_public_key(Self::KEY_ED25519, &key.key.0))
+            Ok(Self::from_type_and_public_key(Self::KEY_ED25519, key.key.as_slice()))
         } else {
             fail!("Unsupported public key type {:?}", src)
         }
@@ -657,7 +657,7 @@ impl KeyOption {
             fail!("Export is supported only for Ed25519 keys")
         }
         let ret = Ed25519 { 
-            key: ton::int256(*self.pub_key()?) 
+            key: UInt256::with_array(*self.pub_key()?) 
         }.into_boxed();
         Ok(ret)
     }
@@ -730,7 +730,7 @@ impl Query {
         };
         let msg = TaggedAdnlMessage {
             object: AdnlQueryMessage {
-                query_id: ton::int256(query_id),
+                query_id: UInt256::with_array(query_id),
                 query: ton::bytes(query)
             }.into_boxed(),
             #[cfg(feature = "telemetry")]
@@ -1172,12 +1172,6 @@ pub fn deserialize_bundle(bytes: &[u8]) -> Result<Vec<TLObject>> {
         }
     }
     Ok(ret)
-}
-
-/// Get 256 bits as byte array out of ton::int256 
-pub fn get256(src: &ton::int256) -> &[u8; 32] {
-    let ton::int256(ret) = src;
-    ret
 }
 
 /// Calculate hash of TL object, non-boxed option
