@@ -13,8 +13,8 @@
 
 use crate::{
     common::{
-        AdnlHandshake, AdnlStream, AdnlStreamCrypto, deserialize, get256, 
-        KeyOption, KeyOptionJson, Query, serialize, TaggedTlObject, Timeouts
+        AdnlHandshake, AdnlStream, AdnlStreamCrypto, deserialize, KeyOption, KeyOptionJson, 
+        Query, serialize, TaggedTlObject, Timeouts
     }
 };
 use rand::Rng;
@@ -183,11 +183,12 @@ impl AdnlClient {
             .downcast::<AdnlMessage>()
             .map_err(|answer| error!("Unsupported ADNL message {:?}", answer))?;
         match answer {
-            AdnlMessage::Adnl_Message_Answer(answer) => if &query_id == get256(&answer.query_id) {
-                deserialize(&answer.answer)
-            } else {
-                fail!("Query ID mismatch {:?} vs {:?}", query.object, answer)
-            },
+            AdnlMessage::Adnl_Message_Answer(answer) => 
+                if &query_id == answer.query_id.as_slice() {
+                    deserialize(&answer.answer)
+                } else {
+                    fail!("Query ID mismatch {:?} vs {:?}", query.object, answer)
+                },
             _ => fail!("Unexpected answer to query {:?}: {:?}", query.object, answer)
         } 
     }
