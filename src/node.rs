@@ -3604,51 +3604,54 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
         } else {
             MessageRepeat::Unapplicable
         };
-        let mut data = serialize(
-            &AdnlPacketContents {
-                rand1: ton::bytes(Self::gen_rand()),
-                from: if channel.is_some() {
-                    None
-                } else {
-                    Some(source.into_tl_public_key()?)
-                },
-                from_short: if channel.is_some() {
-                    None
-                } else {
-                    Some(
-                        AdnlIdShort {
-                            id: UInt256::with_array(source.id().data().clone())
-                        }
-                    )
-                }, 
-                message,
-                messages: if let Some(messages) = messages {
-                    Some(messages.into())
-                } else {
-                    None
-                },
-                address: Some(
-                    self.build_address_list(Some(Version::get() + Self::TIMEOUT_ADDRESS_SEC))?
-                ),
-                priority_address: None,
-                seqno: Some(peer.send_state.next_seqno(priority) as i64),
-                confirm_seqno: Some(peer.recv_state.seqno(priority) as i64),
-                recv_addr_list_version: None,
-                recv_priority_addr_list_version: None,
-                reinit_date: if channel.is_some() {
-                    None
-                } else {
-                    Some(peer.recv_state.reinit_date())
-                },
-                dst_reinit_date: if channel.is_some() {
-                   None
-                } else {
-                    Some(peer.send_state.reinit_date())
-                },
-                signature: None,
-                rand2: ton::bytes(Self::gen_rand())
-            }.into_boxed()
-        )?;
+        let mut pkt = AdnlPacketContents {
+            rand1: ton::bytes(Self::gen_rand()),
+            from: if channel.is_some() {
+                None
+            } else {
+                Some(source.into_tl_public_key()?)
+            },
+            from_short: if channel.is_some() {
+                None
+            } else {
+                Some(
+                    AdnlIdShort {
+                        id: UInt256::with_array(source.id().data().clone())
+                    }
+                )
+            }, 
+            message,
+            messages: if let Some(messages) = messages {
+                Some(messages.into())
+            } else {
+                None
+            },
+            address: Some(
+                self.build_address_list(Some(Version::get() + Self::TIMEOUT_ADDRESS_SEC))?
+            ),
+            priority_address: None,
+            seqno: Some(peer.send_state.next_seqno(priority) as i64),
+            confirm_seqno: Some(peer.recv_state.seqno(priority) as i64),
+            recv_addr_list_version: None,
+            recv_priority_addr_list_version: None,
+            reinit_date: if channel.is_some() {
+                None
+            } else {
+                Some(peer.recv_state.reinit_date())
+            },
+            dst_reinit_date: if channel.is_some() {
+                None
+            } else {
+                Some(peer.send_state.reinit_date())
+            },
+            signature: None,
+            rand2: ton::bytes(Self::gen_rand())
+        };
+        if channel.is_none() {
+            let signature = source.sign(&serialize(&pkt.clone().into_boxed())?)?;
+            pkt.signature = Some(ton::bytes(signature.to_vec()));
+        }
+        let mut data = serialize(&pkt.into_boxed())?;
         if let Some(channel) = channel {
             if priority {
                 channel.encrypt_priority(&mut data)?;
