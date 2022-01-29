@@ -7,7 +7,6 @@ version = '0.7.65'
 
 [workspace]
 
-
 [dependencies]
 aes-ctr = '0.6.0'
 async-trait = '0.1.22'
@@ -48,4 +47,3 @@ node = [ 'external-ip' ]
 server = [  ]
 static_workers = [  ]
 telemetry = [  ]
-
