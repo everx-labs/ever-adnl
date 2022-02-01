@@ -1862,6 +1862,7 @@ pub struct AdnlNode {
     channels_incinerator: lockfree::map::SharedIncin<Arc<KeyId>, Arc<AdnlChannel>>,
     channels_recv: Arc<ChannelsRecv>,
     config: AdnlNodeConfig,
+    options: AtomicU32,
     peers: lockfree::map::Map<Arc<KeyId>, Arc<Peers>>,
     queries: Arc<QueryCache>, 
     queue_monitor_queries: lockfree::queue::Queue<(u64, QueryId)>,
@@ -1977,6 +1978,7 @@ impl AdnlNode {
             channels_incinerator: incinerator, 
             channels_recv: Arc::new(lockfree::map::Map::new()), 
             config, 
+            options: AtomicU32::new(0),
             peers,
             queries: Arc::new(lockfree::map::Map::new()), 
             queue_monitor_queries: lockfree::queue::Queue::new(),
@@ -2003,6 +2005,11 @@ impl AdnlNode {
 //        if self.queue_send_packets.count.load(atomic::Ordering::Relaxed) != 0 {
 //            panic!("Fuckup with queue")
 //        }
+    }
+
+    /// Set ADNL options
+    pub fn set_options(&self, options: u32) {
+        self.options.fetch_or(options, atomic::Ordering::Relaxed);
     }
 
     /// Start node 
@@ -2338,6 +2345,7 @@ impl AdnlNode {
         Ok(())
     }       
 
+    /// Stop node
     pub async fn stop(&self) {
         log::warn!(target: TARGET, "Stopping ADNL node");
         self.stop.fetch_add(1, atomic::Ordering::Relaxed);
@@ -2829,11 +2837,22 @@ impl AdnlNode {
         local_key: &Arc<KeyId>,
         other_key: Option<Arc<KeyId>>
     ) -> Result<Option<Arc<KeyId>>> {
-        let ret = if let Some(other_key) = &other_key {
+
+        fn check_signature(packet: &AdnlPacketContents, key: &Arc<KeyOption>) -> Result<()> {
+            if let Some(signature) = &packet.signature {
+                let mut to_sign = packet.clone();
+                to_sign.signature = None;
+                key.verify(&serialize(&to_sign.into_boxed())?, &signature)
+            } else {
+                Ok(())
+            }
+        } 
+
+        let (ret, check) = if let Some(other_key) = &other_key {
             if packet.from.is_some() || packet.from_short.is_some() {
                 fail!("Explicit source address inside channel packet")
             }
-            other_key.clone()
+            (other_key.clone(), true)
         } else if let Some(pub_key) = &packet.from {
             let key = Arc::new(KeyOption::from_tl_public_key(pub_key)?);
             let other_key = key.id().clone();
@@ -2842,13 +2861,14 @@ impl AdnlNode {
                     fail!("Mismatch between ID and key inside packet")
                 }
             }
+            check_signature(packet, &key)?;
             if let Some(address) = &packet.address {
                 let ip_address = Self::parse_address_list(address)?;
                 self.add_peer(&local_key, &ip_address, &key)?;
             }
-            other_key
+            (other_key, false)
         } else if let Some(id) = &packet.from_short {
-            KeyId::from_data(id.id.as_slice().clone())
+            (KeyId::from_data(id.id.as_slice().clone()), true)
         } else {
             fail!("No other key data inside packet: {:?}", packet)
         };
@@ -2873,7 +2893,59 @@ impl AdnlNode {
             fail!("Unknown peer {}", ret)
         };
         let peer = peer.val();
+        if check {
+            check_signature(packet, &peer.address.key)?
+        }
         if let (Some(dst_reinit_date), Some(reinit_date)) = (dst_reinit_date, reinit_date) {
+            let local_reinit_date = peer.recv_state.reinit_date();
+            let cmp_dst = dst_reinit_date.cmp(&local_reinit_date);
+            if let Ordering::Greater = cmp_dst {
+                fail!(
+                    "Destination reinit date is too new: {} vs {}, {:?}", 
+                    dst_reinit_date,
+                    local_reinit_date,  
+                    packet
+                )
+            }
+            if *reinit_date > Version::get() + Self::CLOCK_TOLERANCE_SEC {
+                fail!("Source reinit date is too new: {}", reinit_date)
+            }
+            let other_reinit_date = peer.send_state.reinit_date();
+            match reinit_date.cmp(&other_reinit_date) {
+                Ordering::Equal => (),
+                Ordering::Greater => {
+                    // Refresh reinit state
+                    peer.send_state.reset_reinit_date(*reinit_date);
+                    if other_reinit_date != 0 {
+                        peer.send_state.reset_seqno().await?;
+                        peer.recv_state.reset_seqno().await?;
+                    }
+                },
+                Ordering::Less => if *reinit_date != 0 {
+                    fail!("Source reinit date is too old: {}", reinit_date)
+                }
+            }
+            if *dst_reinit_date != 0 {
+                if let Ordering::Less = cmp_dst {
+                    // Push peer to refresh reinit date
+                    self.send_message_to_peer(
+                        TaggedAdnlMessage {
+                            object: AdnlMessage::Adnl_Message_Nop,
+                            #[cfg(feature = "telemetry")]
+                            tag: 0x80000000 // Service message, tag is not important
+                        },
+                        &AdnlPeers::with_keys(local_key.clone(), ret.clone()),
+                        false,
+                    )?;
+                    fail!(
+                        "Destination reinit date is too old: {} vs {}, {:?}", 
+                        dst_reinit_date, 
+                        other_reinit_date,  
+                        packet
+                    )
+                }
+            }
+/*            
             if dst_reinit_date != &0 {
                 match dst_reinit_date.cmp(&peer.recv_state.reinit_date()) {
                     Ordering::Equal => (),                                                                                                               
@@ -2918,6 +2990,7 @@ impl AdnlNode {
                 Ordering::Less => 
                     fail!("Source reinit date is too old: {}", reinit_date)
             }
+*/
         }
         if let Some(seqno) = &packet.seqno {
             match peer.recv_state.save_seqno(*seqno as u64, priority).await {
