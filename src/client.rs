@@ -13,15 +13,17 @@
 
 use crate::{
     common::{
-        AdnlHandshake, AdnlStream, AdnlStreamCrypto, deserialize, KeyOption, KeyOptionJson, 
-        Query, serialize, TaggedTlObject, Timeouts
+        AdnlHandshake, AdnlStream, AdnlStreamCrypto, Query, TaggedTlObject, Timeouts
     }
 };
+use ever_crypto::{Ed25519KeyOption, KeyOption, KeyOptionJson};
 use rand::Rng;
-use std::{convert::TryInto, net::SocketAddr, time::{Duration, SystemTime}};
-use ton_api::ton::{
-    TLObject, adnl::{Message as AdnlMessage, Pong as AdnlPongBoxed},
-    rpc::adnl::Ping as AdnlPing
+use std::{convert::TryInto, net::SocketAddr, sync::Arc, time::{Duration, SystemTime}};
+use ton_api::{deserialize_boxed, serialize_boxed,
+    ton::{
+        TLObject, adnl::{Message as AdnlMessage, Pong as AdnlPongBoxed},
+        rpc::adnl::Ping as AdnlPing
+    }
 };
 #[cfg(feature = "telemetry")]
 use ton_api::{BoxedSerialize, ConstructorNumber};
@@ -48,9 +50,9 @@ impl AdnlClientConfigJson {
 
 /// ADNL client configuration
 pub struct AdnlClientConfig {
-    client_key: Option<KeyOption>,
+    client_key: Option<Arc<dyn KeyOption>>,
     server_address: SocketAddr,
-    server_key: KeyOption,
+    server_key: Arc<dyn KeyOption>,
     timeouts: Timeouts
 }
 
@@ -66,12 +68,12 @@ impl AdnlClientConfig {
     pub fn from_json_config(
         json_config: AdnlClientConfigJson
     ) -> Result<(Option<AdnlClientConfigJson>, Self)> {
-        let server_key = KeyOption::from_public_key(&json_config.server_key)?;
+        let server_key = Ed25519KeyOption::from_public_key_json(&json_config.server_key)?;
         let mut result_config = None;
         let client_key = if let Some(key) = &json_config.client_key {
-            Some(KeyOption::from_private_key(key)?)
+            Some(Ed25519KeyOption::from_private_key_json(key)?)
         } else {
-            let (json, key) = KeyOption::with_type_id(KeyOption::KEY_ED25519)?;
+            let (json, key) = Ed25519KeyOption::generate_with_json()?;
             result_config = Some(
                 AdnlClientConfigJson {
                     client_key: Some(json),
@@ -170,8 +172,8 @@ impl AdnlClient {
 
     /// Query server
     pub async fn query(&mut self, query: &TaggedTlObject) -> Result<TLObject> {
-        let (query_id, msg) = Query::build(None, query)?;        
-        let mut buf = serialize(&msg.object)?;
+        let (query_id, msg) = Query::build(None, query)?;
+        let mut buf = serialize_boxed(&msg.object)?;
         self.crypto.send(&mut self.stream, &mut buf).await?;
         loop {
             self.crypto.receive(&mut buf, &mut self.stream).await?;
@@ -179,13 +181,13 @@ impl AdnlClient {
                 break;
             }
         }
-        let answer = deserialize(&buf[..])?
+        let answer = deserialize_boxed(&buf[..])?
             .downcast::<AdnlMessage>()
             .map_err(|answer| error!("Unsupported ADNL message {:?}", answer))?;
         match answer {
             AdnlMessage::Adnl_Message_Answer(answer) => 
                 if &query_id == answer.query_id.as_slice() {
-                    deserialize(&answer.answer)
+                    deserialize_boxed(&answer.answer)
                 } else {
                     fail!("Query ID mismatch {:?} vs {:?}", query.object, answer)
                 },
@@ -206,7 +208,7 @@ impl AdnlClient {
         } else {
             AdnlHandshake::build_packet(
                 &mut buf, 
-                &KeyOption::from_ed25519_secret_key(ed25519_dalek::SecretKey::generate(&mut rng))?,
+                &Ed25519KeyOption::generate()?,
                 &config.server_key
             )?
         }

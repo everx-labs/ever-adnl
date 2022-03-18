@@ -17,30 +17,28 @@ use crate::{
         add_counted_object_to_map, add_counted_object_to_map_with_update, 
         add_unbound_object_to_map, add_unbound_object_to_map_with_update,
         AdnlCryptoUtils, AdnlHandshake, AdnlPeers, AdnlPingSubscriber, CountedObject, 
-        Counter, deserialize, hash, KeyId, KeyOption, KeyOptionJson, Query, QueryCache, 
-        QueryId, serialize, Subscriber, TARGET, TaggedAdnlMessage, TaggedByteSlice, 
-        TaggedTlObject, UpdatedAt, Version
+        Counter, hash, Query, QueryCache, QueryId, Subscriber, TARGET, 
+        TaggedAdnlMessage, TaggedByteSlice, TaggedTlObject, UpdatedAt, Version
     }
 };
+#[cfg(feature = "dump")]
+use crate::dump;
 #[cfg(feature = "telemetry")]
-use crate::{
-    common::tag_from_data, 
-    telemetry::{Metric, MetricBuilder, TelemetryItem, TelemetryPrinter}
-};
+use crate::telemetry::{Metric, MetricBuilder, TelemetryItem, TelemetryPrinter};
+
 use aes_ctr::cipher::stream::SyncStreamCipher;
+use ever_crypto::{Ed25519KeyOption, KeyId, KeyOption, KeyOptionJson, sha256_digest};
 use rand::Rng;
-use sha2::Digest;
-use socket2::{Domain, SockAddr, Socket, Type};
 use std::{
     cmp::{max, min, Ordering}, collections::VecDeque, fmt::{self, Debug, Display, Formatter}, 
-    convert::TryInto, io::ErrorKind, net::{IpAddr, Ipv4Addr, SocketAddr}, 
+    convert::TryInto, io::{Cursor, ErrorKind}, net::{IpAddr, Ipv4Addr, SocketAddr}, 
     sync::{Arc, Condvar, Mutex, atomic::{self, AtomicI32, AtomicU32, AtomicU64, AtomicUsize}},
     time::{Duration, Instant}, thread
 };
-#[cfg(feature = "compression")]
-use std::io::Cursor;
+#[cfg(feature = "dump")]
+use std::{fs::{create_dir_all, OpenOptions, rename}, io::Write, path::PathBuf};
 use ton_api::{
-    IntoBoxed, 
+    deserialize_boxed, IntoBoxed, serialize_boxed, 
     ton::{
         self, TLObject,  
         adnl::{
@@ -55,6 +53,8 @@ use ton_api::{
         pub_::publickey::Aes as AesKey
     }
 };
+#[cfg(feature = "telemetry")]
+use ton_api::{tag_from_data};
 use ton_types::{error, fail, Result, UInt256};
 
 const TARGET_QUERY: &str = "adnl_query";
@@ -331,15 +331,14 @@ impl AdnlChannel {
 
     fn with_keys(
         local_key: &Arc<KeyId>, 
-        channel_pvt_key: &Arc<KeyOption>, 
+        channel_pvt_key: &Arc<dyn KeyOption>, 
         other_key: &Arc<KeyId>,
         channel_pub_key: &[u8; 32],
         counter: Arc<AtomicU64>
     ) -> Result<Self> {
-        let fwd_secret = AdnlCryptoUtils::calc_shared_secret(
-            channel_pvt_key.pvt_key()?, 
+        let fwd_secret = channel_pvt_key.shared_secret(
             channel_pub_key
-        );
+        )?;
         let cmp = local_key.cmp(other_key);
         let (fwd_secret, rev_secret) = if Ordering::Equal == cmp {
             (fwd_secret, fwd_secret.clone())
@@ -410,7 +409,7 @@ impl AdnlChannel {
             fail!("Channel message is too short: {}", buf.len())
         }
         Self::process_data(buf, &side.secret)?;
-        if !sha2::Sha256::digest(&buf[64..]).as_slice().eq(&buf[32..64]) {
+        if !sha256_digest(&buf[64..]).eq(&buf[32..64]) {
             fail!("Bad channel message checksum");
         }
         buf.drain(0..64);
@@ -426,7 +425,7 @@ impl AdnlChannel {
     }
 
     fn encrypt(buf: &mut Vec<u8>, side: &SubchannelSide) -> Result<()> {
-        let checksum = sha2::Sha256::digest(buf);
+        let checksum = sha256_digest(buf);
         let len = buf.len();
         buf.resize(len + 64, 0);
         buf[..].copy_within(..len, 64);
@@ -466,27 +465,77 @@ impl AdnlChannel {
 }
 
 struct AdnlNodeAddress {
-    channel_key: Arc<KeyOption>,
+    channel_key: Arc<dyn KeyOption>,
     ip_address: AtomicU64,
-    key: Arc<KeyOption>
+    ip_version: AtomicU32,
+    key: Arc<dyn KeyOption>
 }
 
 impl AdnlNodeAddress {
-    fn from_ip_address_and_key(ip_address: IpAddress, key: Arc<KeyOption>) -> Result<Self> {
-        let (_, channel_key) = KeyOption::with_type_id(key.type_id())?;
+
+    fn from_ip_address_and_key(ip_address: &IpAddress, key: &Arc<dyn KeyOption>) -> Result<Self> {
+        let channel_key = Ed25519KeyOption::generate()?;
         let ret = Self {
-            channel_key: Arc::new(channel_key),
-            ip_address: AtomicU64::new(ip_address.0),
-            key
+            channel_key: channel_key,
+            ip_address: AtomicU64::new(ip_address.address),
+            ip_version: AtomicU32::new(ip_address.version as u32),
+            key: key.clone()
         };
         Ok(ret)
     }
+
+    fn update(&self, ip_address: &IpAddress) -> bool {
+        const LOCK_BIT: u64 = 0x8000000000000000;
+        loop {
+            let old_version = self.ip_version.load(atomic::Ordering::Relaxed);
+            if old_version >= ip_address.version as u32 {
+                 break false
+            }
+            let old_address = self.ip_address.fetch_or(LOCK_BIT, atomic::Ordering::Relaxed);
+            if (old_address & LOCK_BIT) != 0 {
+                // Locked for write, concurrent change
+                continue
+            }
+            if self.ip_version.compare_exchange(
+                old_version,
+                ip_address.version as u32, 
+                atomic::Ordering::Relaxed,
+                atomic::Ordering::Relaxed
+            ).is_err() {
+                // Concurrent change, restore data
+                self.ip_address.compare_exchange(
+                    old_address | LOCK_BIT,
+                    old_address, 
+                    atomic::Ordering::Relaxed,
+                    atomic::Ordering::Relaxed
+                ).ok();
+                continue 
+            }
+            if self.ip_address.compare_exchange(
+                old_address | LOCK_BIT,
+                ip_address.address,
+                atomic::Ordering::Relaxed,
+                atomic::Ordering::Relaxed
+            ).is_err() {
+                // Concurrent change, restore data
+                self.ip_version.compare_exchange(
+                    ip_address.version as u32,
+                    old_version, 
+                    atomic::Ordering::Relaxed,
+                    atomic::Ordering::Relaxed
+                ).ok();
+                continue
+            }
+            break true
+        }
+    }
+
 }
 
 /// ADNL node configuration
 pub struct AdnlNodeConfig {
     ip_address: IpAddress,
-    keys: lockfree::map::Map<Arc<KeyId>, Arc<KeyOption>>,
+    keys: lockfree::map::Map<Arc<KeyId>, Arc<dyn KeyOption>>,
     tags: lockfree::map::Map<usize, Arc<KeyId>>,
     recv_pipeline_pool: Option<u8>, // %% of cpu cores to assign for recv workers
     recv_priority_pool: Option<u8>, // %% of workers to assign for priority recv
@@ -512,17 +561,17 @@ impl AdnlNodeConfigJson {
 
     /// Get IP address 
     pub fn ip_address(&self) -> Result<IpAddress> {
-        IpAddress::from_string(&self.ip_address)
+        IpAddress::from_versioned_string(&self.ip_address, None)
     }   
 
     /// Get key by tag
-    pub fn key_by_tag(&self, tag: usize, as_src: bool) -> Result<KeyOption> {
+    pub fn key_by_tag(&self, tag: usize, as_src: bool) -> Result<Arc<dyn KeyOption>> {
         for key in self.keys.iter() {
             if key.tag == tag {
                 return if as_src {
-                    KeyOption::from_private_key(&key.data)
+                    Ok(Ed25519KeyOption::from_private_key_json(&key.data)?)
                 } else {
-                    KeyOption::from_public_key(&key.data)
+                    Ok(Ed25519KeyOption::from_public_key_json(&key.data)?)
                 }
             }
         }
@@ -536,10 +585,10 @@ impl AdnlNodeConfig {
     /// Construct from IP address and key data
     pub fn from_ip_address_and_keys(
         ip_address: &str, 
-        keys: Vec<(KeyOption, usize)>
+        keys: Vec<(Arc<dyn KeyOption>, usize)>
     ) -> Result<Self> {
         let ret = AdnlNodeConfig {
-            ip_address: IpAddress::from_string(ip_address)?,
+            ip_address: IpAddress::from_versioned_string(ip_address, None)?,
             keys: lockfree::map::Map::new(),
             tags: lockfree::map::Map::new(),
             recv_pipeline_pool: None,
@@ -555,25 +604,24 @@ impl AdnlNodeConfig {
     /// Construct from IP address and private key data
     pub fn from_ip_address_and_private_keys(
         ip_address: &str, 
-        type_id: i32, 
         keytags: Vec<([u8; 32], usize)>
     ) -> Result<(AdnlNodeConfigJson, Self)> {
         let mut keys = Vec::new();
         for (key, tag) in keytags {
-            let (json, key) = KeyOption::from_type_and_private_key(type_id, &key)?;
-            keys.push((json, key, tag))
+            let (json, key) = Ed25519KeyOption::from_private_key_with_json(&key)?;
+            keys.push((json, key as Arc<dyn KeyOption>, tag))
         }
         Self::create_configs(ip_address, keys)
     } 
    
     /// Construct from JSON data 
-    pub fn from_json(json: &str, as_src: bool) -> Result<Self> {
+    pub fn from_json(json: &str) -> Result<Self> {
         let json_config: AdnlNodeConfigJson = serde_json::from_str(json)?;
-        Self::from_json_config(&json_config, as_src)
+        Self::from_json_config(&json_config)
     }
 
     /// Construct from JSON config structure
-    pub fn from_json_config(json_config: &AdnlNodeConfigJson, as_src: bool) -> Result<Self> {
+    pub fn from_json_config(json_config: &AdnlNodeConfigJson) -> Result<Self> {
         let ret = AdnlNodeConfig {
             ip_address: json_config.ip_address()?,
             keys: lockfree::map::Map::new(),
@@ -583,26 +631,21 @@ impl AdnlNodeConfig {
             throughput: json_config.throughput
         };
         for key in json_config.keys.iter() {
-            let data = if as_src {
-                KeyOption::from_private_key(&key.data)?
-            } else {
-                KeyOption::from_public_key(&key.data)?
-            };
+            let data = Ed25519KeyOption::from_private_key_json(&key.data)?;
             ret.add_key(data, key.tag)?;
         }
         Ok(ret)
     }
 
     /// Construct with given IP address (new key pair will be generated)
-    pub fn with_ip_address_and_key_type(
+    pub fn with_ip_address_and_private_key_tags(
         ip_address: &str, 
-        type_id: i32, 
         tags: Vec<usize>
     ) -> Result<(AdnlNodeConfigJson, Self)> {
         let mut keys = Vec::new();
         for tag in tags {
-            let (json, key) = KeyOption::with_type_id(type_id)?;
-            keys.push((json, key, tag))
+            let (json, key) = Ed25519KeyOption::generate_with_json()?;
+            keys.push((json, key as Arc<dyn KeyOption>, tag))
         }
         Self::create_configs(ip_address, keys)
     }    
@@ -613,7 +656,7 @@ impl AdnlNodeConfig {
     }
 
     /// Node key by ID
-    pub fn key_by_id(&self, id: &Arc<KeyId>) -> Result<Arc<KeyOption>> {
+    pub fn key_by_id(&self, id: &Arc<KeyId>) -> Result<Arc<dyn KeyOption>> {
         if let Some(key) = self.keys.get(id) {
             Ok(key.val().clone())
         } else {
@@ -622,7 +665,7 @@ impl AdnlNodeConfig {
     }
 
     /// Node key by tag
-    pub fn key_by_tag(&self, tag: usize) -> Result<Arc<KeyOption>> {
+    pub fn key_by_tag(&self, tag: usize) -> Result<Arc<dyn KeyOption>> {
         if let Some(id) = self.tags.get(&tag) {
             self.key_by_id(id.val())
         } else {
@@ -655,7 +698,7 @@ impl AdnlNodeConfig {
         }
     }
 
-    fn add_key(&self, key: KeyOption, tag: usize) -> Result<Arc<KeyId>> {
+    fn add_key(&self, key: Arc<dyn KeyOption>, tag: usize) -> Result<Arc<KeyId>> {
         let mut ret = key.id().clone();
         let added = add_unbound_object_to_map_with_update(
             &self.tags, 
@@ -672,7 +715,6 @@ impl AdnlNodeConfig {
             }
         )?;
         if added {
-            let key = Arc::new(key);
             add_unbound_object_to_map_with_update(
                 &self.keys, 
                 ret.clone(), 
@@ -688,7 +730,7 @@ impl AdnlNodeConfig {
 
     fn create_configs(
         ip_address: &str, 
-        keys: Vec<(KeyOptionJson, KeyOption, usize)>
+        keys: Vec<(KeyOptionJson, Arc<dyn KeyOption>, usize)>
     ) -> Result<(AdnlNodeConfigJson, Self)> {
         let mut json_keys = Vec::new();
         let mut tags_keys = Vec::new();
@@ -699,7 +741,7 @@ impl AdnlNodeConfig {
                     data: json
                 }
             );
-            tags_keys.push((key, tag));            
+            tags_keys.push((key, tag));
         }
         let json = AdnlNodeConfigJson { 
             ip_address: ip_address.to_string(),
@@ -737,27 +779,29 @@ impl AdnlNodeConfig {
 
 }
 
-#[cfg(feature = "compression")] 
 pub struct DataCompression;
 
-#[cfg(feature = "compression")] 
 impl DataCompression {
 
     const COMPRESSION_LEVEL: i32 = 0;
     const SIZE_COMPRESSION_THRESHOLD: usize = 256;
     const TAG_COMPRESSED: u8 = 0x80;
-    const TAG_UNCOMPRESSED: u8 = 0x00;
  
     pub fn compress(data: &[u8]) -> Result<Vec<u8>> {
         let uncompressed = data.len();
         if uncompressed <= Self::SIZE_COMPRESSION_THRESHOLD {
-            let mut ret = Vec::with_capacity(data.len() + 1);
-            ret.extend_from_slice(data);  
-            log::info!(target: TARGET, "Compression: {} sent as is", uncompressed);
-            ret.push(Self::TAG_UNCOMPRESSED);
-            Ok(ret)
+            Ok(data.to_vec())
         } else {
-            let mut ret = zstd::stream::encode_all(Cursor::new(data), Self::COMPRESSION_LEVEL)?;
+            // Heuristic detection of compressed format: 
+            // append original length to the data to be compressed, compress them, 
+            // then append tag byte to already compressed data.
+            // Data considered to be compressed if their last byte is the same as tag byte.
+            // If decompression succeeded, the lengh of the original data must be checked
+            let len_bytes = (uncompressed as u32).to_be_bytes();
+            let mut ret = Cursor::new(Vec::with_capacity(data.len() + 1));
+            zstd::stream::copy_encode(Cursor::new(data), &mut ret, Self::COMPRESSION_LEVEL)?;
+            zstd::stream::copy_encode(Cursor::new(&len_bytes), &mut ret, Self::COMPRESSION_LEVEL)?;
+            let mut ret = ret.into_inner();
             let compressed = ret.len();
             log::info!(target: TARGET, "Compression: {} -> {}", uncompressed, compressed);
             ret.push(Self::TAG_COMPRESSED);
@@ -765,17 +809,41 @@ impl DataCompression {
         }
     } 
 
-    pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
+    pub fn decompress(data: &[u8]) -> Option<Vec<u8>> {
         let len = data.len();
         if len == 0 {
-            fail!("Too short input data for decompression")
-        }
-        match data[len - 1] {
-            Self::TAG_COMPRESSED => 
-                Ok(zstd::stream::decode_all(Cursor::new(&data[..len - 1]))?),
-            Self::TAG_UNCOMPRESSED => 
-                Ok(data[..len - 1].to_vec()),
-            x => fail!("Bad compression tag {:x}", x) 
+            log::debug!(target: TARGET, "Too short input data for decompression");
+            None
+        } else {
+            match data[len - 1] {
+                Self::TAG_COMPRESSED => 
+                    match zstd::stream::decode_all(Cursor::new(&data[..len - 1])) {
+                        Err(e) => {
+                            log::debug!(target: TARGET, "Decompression error: {}", e);
+                            None
+                        },
+                        Ok(mut ret) => {
+                            let len = ret.len();
+                            if ret.len() < 4 { 
+                                None           
+                            } else {
+                                let src_len = 
+                                    ((ret[len - 4] as usize) << 24) | ((ret[len - 3] as usize) << 16) | 
+                                    ((ret[len - 2] as usize) <<  8) |  (ret[len - 1] as usize);
+                                if src_len != len - 4 {
+                                    None
+                                } else {
+                                    ret.truncate(src_len);
+                                    Some(ret)
+                                } 
+                            }
+                        }
+                    },
+                x => {
+                    log::debug!(target: TARGET, "Bad compression tag {:x}", x);
+                    None
+                }
+            }
         }
     }
 
@@ -783,15 +851,18 @@ impl DataCompression {
 
 /// IP address internal representation
 #[derive(PartialEq)]
-pub struct IpAddress(u64);
+pub struct IpAddress {
+    address: u64,
+    version: i32
+}
 
 impl IpAddress {
 
     /// Construct from string 
-    pub fn from_string(src: &str) -> Result<Self> {
+    pub fn from_versioned_string(src: &str, version: Option<i32>) -> Result<Self> {
         let addr: SocketAddr = src.parse()?;
         if let IpAddr::V4(ip) = addr.ip() {
-            Ok(Self::from_ip_and_port(u32::from_be_bytes(ip.octets()), addr.port()))
+            Ok(Self::from_versioned_parts(u32::from_be_bytes(ip.octets()), addr.port(), version))
         } else {
             fail!("IPv6 addressed are not supported")
         }
@@ -805,31 +876,36 @@ impl IpAddress {
         }
     }
 
-    fn from_ip_and_port(ip: u32, port: u16) -> Self {
-        Self(((ip as u64) << 16) | port as u64)
+    fn from_versioned_parts(ip: u32, port: u16, version: Option<i32>) -> Self {
+        Self {
+            address: ((ip as u64) << 16) | port as u64,
+            version: version.unwrap_or_else(|| Version::get())
+        }
     }
+
     fn ip(&self) -> u32 {
-        let Self(ref ip) = self;
-        (*ip >> 16) as u32
+        (self.address >> 16) as u32
     }
+
     fn port(&self) -> u16 {
-        let Self(ref ip) = self;
-        *ip as u16
+        self.address as u16
     }
-    fn set_ip(&mut self, new_ip: u32) {
-        let Self(ref mut ip) = self;
-        *ip = ((new_ip as u64) << 16) | (*ip & 0xFFFF)
+
+    fn set_ip(&mut self, ip: u32) {
+        self.address = ((ip as u64) << 16) | (self.address & 0xFFFF);
+        self.version = Version::get();
     }
-    fn set_port(&mut self, new_port: u16) {
-        let Self(ref mut ip) = self;
-        *ip = (*ip & 0xFFFFFFFF0000u64) | new_port as u64
+
+    fn set_port(&mut self, port: u16) {
+        self.address = (self.address & 0xFFFFFFFF0000u64) | port as u64;
+        self.version = Version::get();
     }
 
 }
 
 impl Debug for IpAddress {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "{}", self)
+        write!(f, "{} version {}", self, self.version)
     }
 }
 
@@ -838,11 +914,11 @@ impl Display for IpAddress {
         write!(
             f, 
             "{}.{}.{}.{}:{}", 
-            (self.0 >> 40) as u8,
-            (self.0 >> 32) as u8,
-            (self.0 >> 24) as u8,
-            (self.0 >> 16) as u8,
-            self.0 as u16
+            (self.address >> 40) as u8,
+            (self.address >> 32) as u8,
+            (self.address >> 24) as u8,
+            (self.address >> 16) as u8,
+            self.address as u16
         )
     }
 }
@@ -855,9 +931,9 @@ declare_counted!(
     }
 );
 
-#[cfg(feature = "telemetry")]
 impl Peer {
 
+    #[cfg(feature = "telemetry")]
     fn print_state_stats(&self, state: &PeerState, local: &Arc<KeyId>) {
         let elapsed = state.start.elapsed().as_secs();
         let bytes = state.bytes.load(atomic::Ordering::Relaxed);
@@ -872,14 +948,34 @@ impl Peer {
         )
     }
 
+    async fn try_reinit(&self, reinit_date: i32) -> Result<bool> {
+        let old_reinit_date = self.send_state.reinit_date();
+        match reinit_date.cmp(&old_reinit_date) {
+            Ordering::Equal => Ok(true),
+            Ordering::Greater => {
+                // Refresh reinit state
+                self.send_state.reset_reinit_date(reinit_date);
+                if old_reinit_date != 0 {
+                    self.send_state.reset_seqno().await?;
+                    self.recv_state.reset_seqno().await?;
+                }
+                Ok(true)
+            },
+            Ordering::Less => Ok(reinit_date == 0)
+        }
+    }
+
+    #[cfg(feature = "telemetry")]
     fn update_recv_stats(&self, bytes: u64, local: &Arc<KeyId>) {
         self.update_stats(&self.recv_state, bytes, local) 
     }
 
+    #[cfg(feature = "telemetry")]
     fn update_send_stats(&self, bytes: u64, local: &Arc<KeyId>) {
         self.update_stats(&self.send_state, bytes, local) 
     }
 
+    #[cfg(feature = "telemetry")]
     fn update_stats(&self, state: &PeerState, bytes: u64, local: &Arc<KeyId>) {
         if state.update_stats(bytes) {
             self.print_state_stats(state, local);
@@ -1568,7 +1664,7 @@ enum SendJob {
 }
 
 struct SendPipeline {
-    count: AtomicU64,
+//    count: AtomicU64,
     ordinary: Queue<SendJob>,
     priority: Queue<SendJob>,
     lock: Mutex<()>,
@@ -1577,6 +1673,8 @@ struct SendPipeline {
 
 impl SendPipeline {
 
+    const TIMEOUT_WAIT_QUEUE_MS: u64 = 10; 
+
     fn new(
         #[cfg(feature = "telemetry")]
         ordinary_metric: Arc<Metric>,
@@ -1584,7 +1682,7 @@ impl SendPipeline {
         priority_metric: Arc<Metric>
     ) -> Self {
         Self {
-            count: AtomicU64::new(0),
+//            count: AtomicU64::new(0),
             ordinary: Queue::new(
                 #[cfg(feature = "telemetry")]
                 ordinary_metric
@@ -1597,7 +1695,7 @@ impl SendPipeline {
             sync: Condvar::new()
         }
     }
-                                                                                                                    
+
     fn get(&self) -> Result<SendJob> {
         loop {
             let ret = if let Some(ret) = self.priority.get() {
@@ -1606,14 +1704,15 @@ impl SendPipeline {
                 self.ordinary.get()
             };
             if let Some(ret) = ret {
-                self.count.fetch_sub(1, atomic::Ordering::Relaxed);
+//                self.count.fetch_sub(1, atomic::Ordering::Relaxed);
                 return Ok(ret)
             }
-            if self.count.load(atomic::Ordering::Relaxed) > 0 {
-                continue
-            }
-            let _mux = self.sync.wait(
-                self.lock.lock().map_err(|_| error!("Queue mutex poisoned"))?
+//            if self.count.load(atomic::Ordering::Relaxed) > 0 {
+//                continue
+//            }
+            let _mux = self.sync.wait_timeout(
+                self.lock.lock().map_err(|_| error!("Queue mutex poisoned"))?,
+                Duration::from_millis(Self::TIMEOUT_WAIT_QUEUE_MS)
             ).map_err(|_| error!("Queue wait failed"))?;
         }        
     }
@@ -1627,8 +1726,8 @@ impl SendPipeline {
     }
 
     fn put(&self, queue: &Queue<SendJob>, job: SendJob) {
+//      self.count.fetch_add(1, atomic::Ordering::Relaxed);
         queue.put(job);
-        self.count.fetch_add(1, atomic::Ordering::Relaxed);
         self.sync.notify_one();
     }
 
@@ -1847,6 +1946,21 @@ impl Telemetry {
 
 }
 
+#[cfg(feature = "dump")]
+#[derive(Debug)]
+struct DumpRecord {
+    alive: bool,
+    key_id: Arc<KeyId>,
+    msg: String
+}
+
+#[cfg(feature = "dump")]
+struct Dump {
+    path: PathBuf,
+    reader: lockfree::queue::Queue<tokio::sync::mpsc::UnboundedReceiver<DumpRecord>>,
+    sender: tokio::sync::mpsc::UnboundedSender<DumpRecord>
+}
+
 type LoopbackReader = tokio::sync::mpsc::UnboundedReceiver<(AdnlMessage, Arc<KeyId>)>;
 type LoopbackSender = tokio::sync::mpsc::UnboundedSender<(AdnlMessage, Arc<KeyId>)>;
 
@@ -1874,14 +1988,27 @@ pub struct AdnlNode {
     transfers: Arc<lockfree::map::Map<TransferId, Arc<Transfer>>>,
     #[cfg(feature = "telemetry")]                                
     telemetry: Telemetry,
-    allocated: AdnlAlloc
+    allocated: AdnlAlloc,
+    #[cfg(feature = "dump")] 
+    dump: Option<Dump>                               
+}
+
+impl Drop for AdnlNode {
+    fn drop(&mut self) {
+        log::warn!(target: TARGET, "ADNL node dropped");
+    }
 }
 
 impl AdnlNode {
 
+    /// ADNL options
+    pub const OPTION_FORCE_VERSIONING:  u32 = 0x0001; // Force protocol versioning
+    pub const OPTION_FORCE_COMPRESSION: u32 = 0x0002; // Force traffic compression
+
     const CLOCK_TOLERANCE_SEC: i32 = 60; 
     const MAX_ADNL_MESSAGE: usize = 1024;
     const MAX_PACKETS_IN_PROGRESS: u64 = 512;
+    const MAX_PRIORITY_ATTEMPTS: u64 = 10;
     const SIZE_BUFFER: usize = 2048;
     const TIMEOUT_ADDRESS_SEC: i32 = 1000;       
     const TIMEOUT_CHANNEL_RESET_SEC: u64 = 30;   
@@ -1889,10 +2016,14 @@ impl AdnlNode {
     const TIMEOUT_QUERY_MAX_MS: u64 = 5000; 
     const TIMEOUT_QUERY_STOP_MS: u64 = 1; 
     const TIMEOUT_SHUTDOWN_MS: u64 = 2000; 
-    const TIMEOUT_TRANSFER_SEC: u64 = 3;
+    const TIMEOUT_TRANSFER_SEC: u64 = 5;
     
     /// Constructor
-    pub async fn with_config(mut config: AdnlNodeConfig) -> Result<Arc<Self>> {
+    pub async fn with_config(
+        mut config: AdnlNodeConfig,
+        #[cfg(feature = "dump")]                                
+        dump_path: Option<PathBuf>
+    ) -> Result<Arc<Self>> {
         let incinerator = lockfree::map::SharedIncin::new();
         let peers = lockfree::map::Map::new();
         let mut added = false;
@@ -1918,8 +2049,8 @@ impl AdnlNode {
             tokio::sync::mpsc::unbounded_channel();
         #[cfg(feature = "telemetry")] 
         let telemetry = {
-            let ordinary = TelemetryByStage::with_priority(false);
-            let priority = TelemetryByStage::with_priority(true);
+            let ordinary  = TelemetryByStage::with_priority(false);
+            let priority  = TelemetryByStage::with_priority(true);
             let recv_sock = Telemetry::create_metric_builder("socket recv, packets/sec");
             let send_sock = Telemetry::create_metric_builder("socket send, packets/sec");
             let allocated = TelemetryAlloc {
@@ -1995,7 +2126,20 @@ impl AdnlNode {
             transfers: Arc::new(lockfree::map::Map::new()),
             #[cfg(feature = "telemetry")]
             telemetry,
-            allocated
+            allocated,
+            #[cfg(feature = "dump")]
+            dump: if let Some(dump_path) = dump_path {
+                let (sender, reader) = tokio::sync::mpsc::unbounded_channel();
+                let dump = Dump {
+                    path: dump_path,
+                    reader: lockfree::queue::Queue::new(),
+                    sender
+                };
+                dump.reader.push(reader);
+                Some(dump)
+            } else {
+                None
+            }
         };
         ret.queue_send_loopback_readers.push(queue_send_loopback_reader);
         Ok(Arc::new(ret))
@@ -2005,11 +2149,6 @@ impl AdnlNode {
 //        if self.queue_send_packets.count.load(atomic::Ordering::Relaxed) != 0 {
 //            panic!("Fuckup with queue")
 //        }
-    }
-
-    /// Set ADNL options
-    pub fn set_options(&self, options: u32) {
-        self.options.fetch_or(options, atomic::Ordering::Relaxed);
     }
 
     /// Start node 
@@ -2027,7 +2166,11 @@ impl AdnlNode {
         let mut queue_send_loopback_reader = queue_send_loopback_reader.ok_or_else(
             || error!("Loopback reader is not set")
         )?;
-        let socket_recv = Socket::new(Domain::ipv4(), Type::dgram(), None)?;
+        let socket_recv = socket2::Socket::new(
+            socket2::Domain::ipv4(), 
+            socket2::Type::dgram(), 
+            None
+        )?;
 //        socket_recv.set_send_buffer_size(1 << 26)?;
         socket_recv.set_recv_buffer_size(1 << 20)?;        
 //        socket_recv.set_nonblocking(true)?;
@@ -2125,6 +2268,17 @@ impl AdnlNode {
                             log::warn!(target: TARGET, "Cannot close node loopback: {}", e);
                         }
                         recv_stop.shutdown().await;
+                        #[cfg(feature = "dump")]
+                        if let Some(dump) = node_stop.dump.as_ref() {
+                            let stop = DumpRecord {
+                                alive: false,
+                                key_id: KeyId::from_data([0u8; 32]),
+                                msg: String::new()
+                            };
+                            if let Err(e) = dump.sender.send(stop) {
+                                log::warn!(target: TARGET, "Cannot close node dump: {}", e);
+                            }
+                        } 
                         break
                     }
                     let elapsed = start.elapsed().as_millis();
@@ -2257,7 +2411,7 @@ impl AdnlNode {
                         }
                         history.push_back(start_history.elapsed().as_nanos());
                     }
-                    let addr: SockAddr = SocketAddr::new(
+                    let addr: socket2::SockAddr = SocketAddr::new(
                         IpAddr::from(((job.destination >> 16) as u32).to_be_bytes()), 
                         job.destination as u16
                     ).into();
@@ -2281,7 +2435,7 @@ impl AdnlNode {
                         }
                         break
                     }
-                    #[cfg(feature = "telemetry")]
+                    #[cfg(feature = "telemetry")] 
                     node_send.telemetry.send_sock.update(1);
                     if node_send.stop.load(atomic::Ordering::Relaxed) > 0 {
                         if stop {
@@ -2338,10 +2492,71 @@ impl AdnlNode {
                         }            
                     );
                 }
+                Self::graceful_close(queue_send_loopback_reader).await;
                 node_loop.stop.fetch_add(1, atomic::Ordering::Relaxed);
                 log::warn!(target: TARGET, "Node loopback exited");
             }
         );
+        // Traffic dump
+        #[cfg(feature = "dump")]
+        if let Some(dump) = node.dump.as_ref() {
+            let node_dump = node.clone();
+            let mut dump_path = PathBuf::from(&dump.path);  
+            dump_path.push("alive");
+            create_dir_all(&dump_path)?;
+            dump_path.pop();
+            if let Some(mut reader) = dump.reader.pop() {
+                tokio::spawn(
+                    async move {
+                        fn prepare(path: &PathBuf, file: &String, alive: bool) -> Result<PathBuf> {
+                            let dst = if alive {
+                                path.join("alive").join(file)
+                            } else {
+                                path.join(file)
+                            };
+                            if !dst.exists() {
+                                let src = if alive {
+                                    path.join(file)
+                                } else {
+                                    path.join("alive").join(file)
+                                };
+                                if src.exists() {
+                                    rename(src, dst.as_path())?
+                                }
+                            }
+                            Ok(dst)
+                        }
+                        fn print(path: PathBuf, msg: String) -> Result<()> {
+                            let mut file = OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(path)?;
+                            writeln!(file, "{}", msg)?;
+                            Ok(())
+                        }
+                        while let Some(record) = reader.recv().await {
+                            if node_dump.stop.load(atomic::Ordering::Relaxed) > 0 {
+                                break
+                            }
+                            let file = format!("{}", record.key_id).replace("/", "_");
+                            let file = match prepare(&dump_path, &file, record.alive) {
+                                Ok(file) => file, 
+                                Err(e) => {
+                                    log::warn!(target: TARGET, "Error during dump: {}", e);
+                                    continue
+                                }
+                            };
+                            if let Err(e) = print(file, record.msg) {
+                                log::warn!(target: TARGET, "Error during dump: {}", e);
+                            }
+                        }
+                        Self::graceful_close(reader).await;
+                        node_dump.stop.fetch_add(1, atomic::Ordering::Relaxed);
+                        log::warn!(target: TARGET, "Node dump exited");
+                    }
+                );
+            }
+        }
         Ok(())
     }       
 
@@ -2349,9 +2564,19 @@ impl AdnlNode {
     pub async fn stop(&self) {
         log::warn!(target: TARGET, "Stopping ADNL node");
         self.stop.fetch_add(1, atomic::Ordering::Relaxed);
+        let wait_until = {
+            #[cfg(feature = "dump")]
+            if self.dump.is_some() {
+                7
+            } else {
+                6 
+            }
+            #[cfg(not(feature = "dump"))]
+            6
+        };
         loop {
             tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_QUERY_STOP_MS)).await;
-            if self.stop.load(atomic::Ordering::Relaxed) >= 6 {
+            if self.stop.load(atomic::Ordering::Relaxed) >= wait_until {
                 break
             }
         }
@@ -2360,7 +2585,7 @@ impl AdnlNode {
     }
 
     /// Add key
-    pub fn add_key(&self, key: KeyOption, tag: usize) -> Result<Arc<KeyId>> {
+    pub fn add_key(&self, key: Arc<dyn KeyOption>, tag: usize) -> Result<Arc<KeyId>> {
         let ret = self.config.add_key(key, tag)?;
         add_unbound_object_to_map(
             &self.peers,
@@ -2383,31 +2608,24 @@ impl AdnlNode {
         &self, 
         local_key: &Arc<KeyId>, 
         peer_ip_address: &IpAddress, 
-        peer_key: &Arc<KeyOption>
+        peer_key: &Arc<dyn KeyOption>
     ) -> Result<Option<Arc<KeyId>>> {
         if peer_key.id() == local_key {
             return Ok(None)
         }
-        let IpAddress(peer_ip_address) = peer_ip_address;
         let mut error = None;
         let mut ret = peer_key.id().clone();
         let result = self.peers(local_key)?.map_of.insert_with(
             ret.clone(), 
             |key, inserted, found| if let Some((_, found)) = found {
                 ret = key.clone();
-                found.address.ip_address.store(
-                    *peer_ip_address, 
-                    atomic::Ordering::Relaxed
-                );
+                found.address.update(peer_ip_address);
                 lockfree::map::Preview::Discard
             } else if inserted.is_some() {
                 ret = key.clone(); 
                 lockfree::map::Preview::Keep
             } else {
-                let address = AdnlNodeAddress::from_ip_address_and_key(
-                    IpAddress(*peer_ip_address),
-                    peer_key.clone()        
-                );
+                let address = AdnlNodeAddress::from_ip_address_and_key(peer_ip_address, peer_key);
                 match address {
                     Ok(address) => {
                         #[cfg(feature = "telemetry")]
@@ -2448,7 +2666,8 @@ impl AdnlNode {
         if let lockfree::map::Insertion::Created = result {
             log::debug!(
                 target: TARGET, 
-                "Added ADNL peer with keyID {}, key {} to {}", 
+                "Added ADNL peer with IP {}, keyID {}, key {} to {}",
+                peer_ip_address,  
                 base64::encode(peer_key.id().data()),
                 base64::encode(peer_key.pub_key()?),
                 base64::encode(local_key.data())
@@ -2480,6 +2699,11 @@ impl AdnlNode {
         }
     }
 
+    /// Check protocol options
+    pub fn check_options(&self, options: u32) -> bool {
+        (self.options.load(atomic::Ordering::Relaxed) & options) == options
+    }
+
     /// Delete key
     pub fn delete_key(&self, key: &Arc<KeyId>, tag: usize) -> Result<bool> {
         self.peers.remove(key);
@@ -2500,35 +2724,53 @@ impl AdnlNode {
     }
 
     /// Node key by ID
-    pub fn key_by_id(&self, id: &Arc<KeyId>) -> Result<Arc<KeyOption>> {
+    pub fn key_by_id(&self, id: &Arc<KeyId>) -> Result<Arc<dyn KeyOption>> {
         self.config.key_by_id(id)
     }
 
     /// Node key by tag
-    pub fn key_by_tag(&self, tag: usize) -> Result<Arc<KeyOption>> {
+    pub fn key_by_tag(&self, tag: usize) -> Result<Arc<dyn KeyOption>> {
         self.config.key_by_tag(tag)
     }
 
     /// Parse other's address list
-    pub fn parse_address_list(list: &AddressList) -> Result<IpAddress> { 
+    pub fn parse_address_list(list: &AddressList) -> Result<Option<IpAddress>> { 
         if list.addrs.is_empty() {
-            fail!("Empty address list")
+            log::warn!(target: TARGET, "Address list is empty");
+            return Ok(None)
         }
         let version = Version::get();
+        if list.reinit_date > version + Self::CLOCK_TOLERANCE_SEC {
+            log::warn!(
+                target: TARGET, 
+                "Address list is too new: {} vs {}",
+                list.reinit_date, version
+            );
+            return Ok(None)
+        } 
+/*
         if (list.version > version) || (list.reinit_date > version) {
             fail!("Address list version is too high: {} vs {}", list.version, version)
         }
+*/
         if (list.expire_at != 0) && (list.expire_at < version) {
-            fail!("Address list is expired")
+            log::warn!(target: TARGET, "Address list is expired");
+            return Ok(None)
         }
-        let ret = match &list.addrs[0] {
-            Address::Adnl_Address_Udp(x) => IpAddress::from_ip_and_port(
-                x.ip as u32,
-                x.port as u16
-            ),
-            _ => fail!("Only IPv4 address format is supported")
-        };
-        Ok(ret)
+        match &list.addrs[0] {
+            Address::Adnl_Address_Udp(x) => {
+                let ret = IpAddress::from_versioned_parts(
+                    x.ip as u32,
+                    x.port as u16,
+                    Some(list.version)
+                );
+                Ok(Some(ret))
+            },
+            _ => {
+                log::warn!(target: TARGET, "Only IPv4 address format is supported");
+                Ok(None)
+            }
+        }
     }
 
     /// Send query
@@ -2563,12 +2805,6 @@ impl AdnlNode {
             )
         }
  
-        async fn graceful_close<T>(mut reader: tokio::sync::mpsc::UnboundedReceiver<T>) {
-            reader.close();
-            while let Some(_) = reader.recv().await {
-            }
-        }
-
         async fn wait_query(
             node: Arc<AdnlNode>, 
             context: Arc<QuerySendContext>,
@@ -2650,7 +2886,7 @@ impl AdnlNode {
                         tokio::spawn(
                             async move {
                                 if reader.recv().await.is_some() {
-                                    graceful_close(reader).await
+                                    Self::graceful_close(reader).await
                                 } else {
                                     log::warn!(
                                         target: TARGET, 
@@ -2661,7 +2897,7 @@ impl AdnlNode {
                         );
                         reply
                     } else if let Some((reply, _)) = reader.recv().await {
-                        graceful_close(reader).await;
+                        Self::graceful_close(reader).await;
                         reply
                     } else {
                         reader.close();
@@ -2689,8 +2925,11 @@ impl AdnlNode {
         log::warn!(target: TARGET, "Resetting peer pair {} -> {}", local_key, other_key);
         let peer = peer.val();
         let address = AdnlNodeAddress::from_ip_address_and_key(
-            IpAddress(peer.address.ip_address.load(atomic::Ordering::Relaxed)),
-            peer.address.key.clone()        
+            &IpAddress {
+                address: peer.address.ip_address.load(atomic::Ordering::Relaxed),
+                version: Version::get()
+            },
+            &peer.address.key
         )?;
         peers.channels_wait
             .remove(other_key)
@@ -2743,6 +2982,11 @@ impl AdnlNode {
             MessageRepeat::Unapplicable => Ok(()), 
             x => fail!("INTERNAL ERROR: bad repeat {:?} in ADNL custom message", x)
         }
+    }
+
+    /// Set ADNL options
+    pub fn set_options(&self, options: u32) {
+        self.options.fetch_or(options, atomic::Ordering::Relaxed);
     }
 
     async fn add_subchannels(&self, channel: Arc<AdnlChannel>, wait: bool) -> Result<()> {
@@ -2835,40 +3079,51 @@ impl AdnlNode {
         packet: &AdnlPacketContents, 
         priority: bool,
         local_key: &Arc<KeyId>,
-        other_key: Option<Arc<KeyId>>
+        channel: Option<&Arc<AdnlChannel>>
     ) -> Result<Option<Arc<KeyId>>> {
 
-        fn check_signature(packet: &AdnlPacketContents, key: &Arc<KeyOption>) -> Result<()> {
+        fn check_signature(
+            packet: &AdnlPacketContents, 
+            key: &Arc<dyn KeyOption>,
+            mandatory: bool
+        ) -> Result<()> {
             if let Some(signature) = &packet.signature {
                 let mut to_sign = packet.clone();
                 to_sign.signature = None;
-                key.verify(&serialize(&to_sign.into_boxed())?, &signature)
+                key.verify(&serialize_boxed(&to_sign.into_boxed())?, &signature)
+            } else if mandatory {
+                fail!("No mandatory signature in ADNL packet")
             } else {
                 Ok(())
             }
         } 
 
-        let (ret, check) = if let Some(other_key) = &other_key {
+        let (ret, mut address_reinit_date, check) = if let Some(channel) = &channel {
             if packet.from.is_some() || packet.from_short.is_some() {
                 fail!("Explicit source address inside channel packet")
             }
-            (other_key.clone(), true)
+            (channel.other_key.clone(), None, true)
         } else if let Some(pub_key) = &packet.from {
-            let key = Arc::new(KeyOption::from_tl_public_key(pub_key)?);
+            let key = Ed25519KeyOption::from_public_key_tl(pub_key)?;
             let other_key = key.id().clone();
             if let Some(id) = &packet.from_short {
                 if other_key.data() != id.id.as_slice() {
                     fail!("Mismatch between ID and key inside packet")
                 }
             }
-            check_signature(packet, &key)?;
+            check_signature(packet, &key, true)?;
             if let Some(address) = &packet.address {
-                let ip_address = Self::parse_address_list(address)?;
-                self.add_peer(&local_key, &ip_address, &key)?;
+                if let Some(ip_address) = Self::parse_address_list(address)? {
+                    self.add_peer(&local_key, &ip_address, &key)?;
+                    (other_key, Some(address.reinit_date), false)
+                } else {
+                    (other_key, None, false)
+                }
+            } else {
+                (other_key, None, false)
             }
-            (other_key, false)
         } else if let Some(id) = &packet.from_short {
-            (KeyId::from_data(id.id.as_slice().clone()), true)
+            (KeyId::from_data(id.id.as_slice().clone()), None, true)
         } else {
             fail!("No other key data inside packet: {:?}", packet)
         };
@@ -2877,13 +3132,17 @@ impl AdnlNode {
         if dst_reinit_date.is_some() != reinit_date.is_some() {
             fail!("Destination and source reinit dates mismatch")
         }
-        let peers = self.peers(&local_key)?;
-        let peer = if other_key.is_some() {
-            if let Some(channel) = peers.channels_send.get(&ret) {
-                peers.map_of.get(&channel.val().other_key)
-            } else {
-                fail!("Unknown channel, ID {:x?}", ret)
+        if let Some(reinit_date) = reinit_date {
+            if let Some(addr_reinit_date) = &address_reinit_date {
+                if addr_reinit_date != reinit_date {
+                    fail!("Address and source reinit dates mismatch")
+                }
+                address_reinit_date = None
             }
+        }
+        let peers = self.peers(&local_key)?;
+        let peer = if let Some(channel) = channel {
+            peers.map_of.get(&channel.other_key)
         } else {
             peers.map_of.get(&ret) 
         };
@@ -2894,7 +3153,7 @@ impl AdnlNode {
         };
         let peer = peer.val();
         if check {
-            check_signature(packet, &peer.address.key)?
+            check_signature(packet, &peer.address.key, false)?
         }
         if let (Some(dst_reinit_date), Some(reinit_date)) = (dst_reinit_date, reinit_date) {
             let local_reinit_date = peer.recv_state.reinit_date();
@@ -2911,6 +3170,11 @@ impl AdnlNode {
                 fail!("Source reinit date is too new: {}", reinit_date)
             }
             let other_reinit_date = peer.send_state.reinit_date();
+            if !peer.try_reinit(*reinit_date).await? {
+                fail!("Source reinit date is too old: {}", reinit_date)
+            }
+/*
+            let other_reinit_date = peer.send_state.reinit_date();
             match reinit_date.cmp(&other_reinit_date) {
                 Ordering::Equal => (),
                 Ordering::Greater => {
@@ -2925,6 +3189,7 @@ impl AdnlNode {
                     fail!("Source reinit date is too old: {}", reinit_date)
                 }
             }
+*/
             if *dst_reinit_date != 0 {
                 if let Ordering::Less = cmp_dst {
                     // Push peer to refresh reinit date
@@ -2992,9 +3257,21 @@ impl AdnlNode {
             }
 */
         }
+        if let Some(address_reinit_date) = address_reinit_date {
+            if !peer.try_reinit(address_reinit_date).await? {
+                log::warn!(
+                    target: TARGET, 
+                    "Address list reinit date is too old: {}",
+                    address_reinit_date
+                )
+            }
+        }
         if let Some(seqno) = &packet.seqno {
             match peer.recv_state.save_seqno(*seqno as u64, priority).await {
-                Err(e) => fail!("Peer {} ({:?}): {}", ret, other_key, e),
+                Err(e) => fail!(
+                    "Peer {} ({:?}): {}", 
+                    ret, channel.map(|ch| ch.other_key.clone()), e
+                ),
                 Ok(false) => return Ok(None),
                 _ => ()
             }
@@ -3049,7 +3326,7 @@ impl AdnlNode {
                 )
             }
         } else {
-            local_pub.replace(local_pub_key.clone());
+            local_pub.replace(local_pub_key.try_into()?);
         }
         let channel = AdnlChannel::with_keys(
             local_key, 
@@ -3117,6 +3394,34 @@ impl AdnlNode {
         ret
     }
 
+    async fn graceful_close<T>(mut reader: tokio::sync::mpsc::UnboundedReceiver<T>) {
+        reader.close();
+        while let Some(_) = reader.recv().await {
+        }
+    }
+
+    #[cfg(feature = "dump")]
+    fn need_dump(pkt: &AdnlPacketContents) -> bool {
+        if let Some(msg) = pkt.message.as_ref() {
+            match msg {
+                AdnlMessage::Adnl_Message_Custom(_) => false,
+                AdnlMessage::Adnl_Message_Nop => false,
+                _ => true
+            }
+        } else if let Some(msgs) = pkt.messages.as_ref() {
+            for msg in msgs.0.iter() {
+                match msg {
+                    AdnlMessage::Adnl_Message_Custom(_) => (),
+                    AdnlMessage::Adnl_Message_Nop => (),
+                    _ => return true
+                }
+            }
+            false
+        } else {
+            false
+        }
+    }
+
     fn peers(&self, src: &Arc<KeyId>) -> Result<Arc<Peers>> {
         if let Some(peers) = self.peers.get(src) {
             Ok(peers.val().clone())
@@ -3166,7 +3471,7 @@ impl AdnlNode {
                                 ).await;
                                 if transfer_wait.updated.is_expired(Self::TIMEOUT_TRANSFER_SEC) {
                                     if transfers_wait.remove(&transfer_id_wait).is_some() {
-                                        log::debug!(
+                                        log::info!(
                                             target: TARGET, 
                                             "ADNL transfer {} timed out",
                                             base64::encode(&transfer_id_wait)
@@ -3327,7 +3632,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
         if let Some(removed) = self.queries.remove(&context.query_id) {
             match removed.val() {
                 Query::Received(answer) => 
-                    return Ok(Some(deserialize(answer)?)),
+                    return Ok(Some(deserialize_boxed(answer)?)),
                 Query::Timeout => if let MessageRepeat::Required = context.repeat {
                     return Ok(None)
                 } else {
@@ -3365,7 +3670,9 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
     ) -> Result<()> {
         #[cfg(feature = "telemetry")]
         let received_len = packet.buf.len();
-        let (priority, local_key, other_key) = match subchannel {
+#[cfg(feature = "debug")]
+println!("RECV {}", received_len);
+        let (priority, local_key, channel) = match &subchannel {
             Subchannel::None => if let Some(local_key) = AdnlHandshake::parse_packet(
                 &self.config.keys, 
                 &mut packet.buf, 
@@ -3384,14 +3691,14 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
             },
             Subchannel::Ordinary(channel) => {
                 self.decrypt_packet_from_channel(&mut packet.buf, &channel, false)?;
-                (false, channel.local_key.clone(), Some(channel.other_key.clone()))
+                (false, channel.local_key.clone(), Some(channel))
             },
             Subchannel::Priority(channel) => {
                 self.decrypt_packet_from_channel(&mut packet.buf, &channel, true)?;
-                (true, channel.local_key.clone(), Some(channel.other_key.clone()))
+                (true, channel.local_key.clone(), Some(channel))
             }
         };
-        let pkt = deserialize(&packet.buf[..])?
+        let pkt = deserialize_boxed(&packet.buf[..])?
             .downcast::<AdnlPacketContentsBoxed>()
             .map_err(|pkt| error!("Unsupported ADNL packet format {:?}", pkt))?
             .only();
@@ -3399,7 +3706,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
             &pkt, 
             priority, 
             &local_key, 
-            other_key
+            channel
         ).await? {
             key
         } else {
@@ -3411,6 +3718,25 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
             }
             return Ok(())
         };
+        #[cfg(feature = "dump")]
+        if Self::need_dump(&pkt) {
+            if let Some(dump) = self.dump.as_ref() {
+                let msg = format!(
+                    "{} Recv packet, priority {}\n{:?}\nDump\n{}", 
+                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                    priority, 
+                    pkt, 
+                    dump!(&packet.buf[..])
+                );
+                dump.sender.send(
+                    DumpRecord {
+                        alive: true,
+                        key_id: other_key.clone(),
+                        msg
+                    }
+                )?;
+            }
+        }
         let peers = Arc::new(AdnlPeers::with_keys(local_key, other_key));
         #[cfg(feature = "telemetry")]
         if let Some(peer) = self.peers(peers.local())?.map_of.get(peers.other()) {
@@ -3543,9 +3869,10 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
 
         let create_channel_msg = if channel.is_none() && peers.channels_wait.get(dst).is_none() {
             log::debug!(target: TARGET, "Create channel {} -> {}", src.id(), dst);
+            let pub_key = peer.address.channel_key.pub_key()?;
             Some(
                 CreateChannel {
-                    key: UInt256::with_array(peer.address.channel_key.pub_key()?.clone()),
+                    key: UInt256::with_array(pub_key.try_into()?),
                     date: Version::get()
                 }.into_boxed()
             )
@@ -3592,14 +3919,13 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
                 )?
             }
         } else {
-            let data = serialize(&msg.object)?;
-            let hash = sha2::Sha256::digest(&data);
-            let hash: &[u8; 32] = hash.as_slice().try_into()?;
+            let data = serialize_boxed(&msg.object)?;
+            let hash = sha256_digest(&data);
             let mut offset = 0;
             let mut repeat = if let Some(create_channel_msg) = create_channel_msg {
                 let part_msg = build_part_message(
                     &data[..],
-                    hash,
+                    &hash,
                     &mut offset, 
                     Self::MAX_ADNL_MESSAGE - SIZE_CREATE_CHANNEL_MSG
                 );
@@ -3619,7 +3945,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
             while offset < data.len() {
                 let part_msg = build_part_message(
                     &data[..], 
-                    hash,
+                    &hash,
                     &mut offset, 
                     Self::MAX_ADNL_MESSAGE
                 );
@@ -3648,7 +3974,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
     fn send_packet(
         &self, 
         peer: &Peer,
-        source: &KeyOption,
+        source: &Arc<dyn KeyOption>,
         channel: Option<&Arc<AdnlChannel>>, 
         message: Option<AdnlMessage>, 
         messages: Option<Vec<AdnlMessage>>,
@@ -3664,7 +3990,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
             } else  {
                 // No need if no priority replies
                 if peer.recv_state.seqno(true) == 0 {
-                    if peer.send_state.seqno(true) > 10 {
+                    if peer.send_state.seqno(true) > Self::MAX_PRIORITY_ATTEMPTS {
                         priority = false
                     }
                 }
@@ -3682,7 +4008,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
             from: if channel.is_some() {
                 None
             } else {
-                Some(source.into_tl_public_key()?)
+                Some(source.into_public_key_tl()?)
             },
             from_short: if channel.is_some() {
                 None
@@ -3721,10 +4047,34 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
             rand2: ton::bytes(Self::gen_rand())
         };
         if channel.is_none() {
-            let signature = source.sign(&serialize(&pkt.clone().into_boxed())?)?;
+            let signature = source.sign(&serialize_boxed(&pkt.clone().into_boxed())?)?;
             pkt.signature = Some(ton::bytes(signature.to_vec()));
         }
-        let mut data = serialize(&pkt.into_boxed())?;
+        #[cfg(feature = "dump")]
+        let msg = if Self::need_dump(&pkt) && self.dump.is_some() {
+            Some(format!("Send packet, priority {}\n{:?}", priority, pkt))
+        } else {
+            None
+        };
+        let mut data = serialize_boxed(&pkt.into_boxed())?;
+        #[cfg(feature = "dump")]
+        if let Some(msg) = msg {
+            if let Some(dump) = self.dump.as_ref() {
+                let msg = format!(
+                    "{} {}\nDump\n{}", 
+                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                    msg, 
+                    dump!(&data[..])
+                );
+                dump.sender.send(
+                    DumpRecord {
+                        alive: channel.is_some(),
+                        key_id: peer.address.key.id().clone(), 
+                        msg
+                    }
+                )?;
+            }
+        }
         if let Some(channel) = channel {
             if priority {
                 channel.encrypt_priority(&mut data)?;
@@ -3732,7 +4082,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
                 channel.encrypt_ordinary(&mut data)?;
             }
         } else {
-            let (_, key) = KeyOption::with_type_id(source.type_id())?;
+            let key = Ed25519KeyOption::generate()? as Arc<dyn KeyOption>;
             AdnlHandshake::build_packet(&mut data, &key, &peer.address.key)?;
         }
         log::trace!(
@@ -3850,10 +4200,10 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
                     fail!("Invalid ADNL part transfer: parts mismatch")
                 }
             }
-            if !sha2::Sha256::digest(&buf).as_slice().eq(transfer_id) {
+            if !sha256_digest(&buf).eq(transfer_id) {
                 fail!("Bad hash of ADNL transfer {}", base64::encode(transfer_id))
             }
-            let msg = deserialize(&buf)?
+            let msg = deserialize_boxed(&buf)?
                 .downcast::<AdnlMessage>()
                 .map_err(|msg| error!("Unsupported ADNL messge {:?}", msg))?;
             Ok(Some(msg))
