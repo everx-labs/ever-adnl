@@ -13,7 +13,7 @@
 
 use aes_ctr::cipher::stream::{NewStreamCipher, SyncStreamCipher};
 use core::ops::Range;
-use ever_crypto::{KeyId, sha256_digest};
+use ever_crypto::{KeyId, Sha2, sha256_digest};
 #[cfg(any(feature = "client", feature = "server", feature = "node"))]
 use ever_crypto::KeyOption;use rand::Rng;
 use std::{
@@ -62,6 +62,11 @@ macro_rules! dump {
                 )
             }
             dump
+        }
+    };
+    (info, $target:expr, $msg:expr, $data:expr) => {
+        if log::log_enabled!(log::Level::Info) {
+            log::info!(target: $target, "{}:\n{}", $msg, dump!($data))
         }
     };
     (debug, $target:expr, $msg:expr, $data:expr) => {
@@ -121,15 +126,6 @@ impl AdnlCryptoUtils {
         ret
     }
 
-/*
-    pub fn build_cipher_secure(key: &mut [u8], ctr: &mut [u8]) -> aes_ctr::Aes256Ctr {
-        let ret = Self::build_cipher_internal(key, ctr);
-        key.iter_mut().for_each(|a| *a = 0);
-        ctr.iter_mut().for_each(|a| *a = 0);
-        ret
-    }
-*/
-
     /// Build AES-based cipher without clearing key data
     pub fn build_cipher_unsecure(
         nonce: &[u8; 160], 
@@ -138,6 +134,82 @@ impl AdnlCryptoUtils {
     ) -> aes_ctr::Aes256Ctr {
         Self::build_cipher_internal(&nonce[range_key], &nonce[range_ctr])
     }
+
+    /// Calculate checksum
+    pub fn calc_checksum(version: &Option<u16>, data: &[u8]) -> [u8; 32] {
+        if let Some(version) = version {
+            let mut sha = Sha2::new();
+            sha.update(&[(*version >> 8) as u8, *version as u8]);
+            sha.update(data);
+            sha.finalize()
+        } else {
+            sha256_digest(data)
+        }
+    }
+
+    /// Decode ADNL version 
+    pub fn decode_version(version: &[u8; 4], hdra: &[u8], hdrb: &[u8]) -> Option<u16> {
+        // Mix encoded version with other bytes of header to decode version
+        let mut xor = version.clone();
+        for i in 0..hdra.len() {
+            xor[i & 0x03] ^= hdra[i];
+        }
+        for i in 0..hdrb.len() {
+            xor[i & 0x03] ^= hdrb[i];
+        }
+        if (xor[0] == xor[2]) && (xor[1] == xor[3]) {
+            Some(((xor[0] as u16) << 8) | (xor[1] as u16))
+        } else {
+            None
+        }
+    }
+
+    /// Encode ADNL header 
+    pub fn encode_header(
+        buf: &mut Vec<u8>,
+        id: &[u8; 32],
+        key: Option<&[u8; 32]>, 
+        version: Option<u16>
+    ) -> [u8; 32] { 
+        let checksum = Self::calc_checksum(&version, buf);
+        let len = buf.len();
+        let hdr = if key.is_some() {
+            96
+        } else {
+            64 
+        } + if version.is_some() {
+            4
+        } else {
+            0
+        };
+        buf.resize(len + hdr, 0);
+        buf[..].copy_within(..len, hdr);
+        buf[..32].copy_from_slice(id);
+        let idx = if let Some(key) = key {
+            buf[32..64].copy_from_slice(key);
+            64
+        } else {
+            32
+        };
+        let idx = if let Some(version) = version {
+            // Mix version with other bytes of header to get encoded version
+            let mut xor = [
+                (version >> 8) as u8, version as u8, (version >> 8) as u8, version as u8
+            ];
+            for i in 0..idx {
+                xor[i & 0x03] ^= buf[i];
+            }
+            for i in 0..checksum.len() {
+                xor[i & 0x03] ^= checksum[i];
+            }
+            buf[idx..idx + 4].copy_from_slice(&xor);
+            idx + 4
+        } else {
+            idx
+        };
+        buf[idx..hdr].copy_from_slice(&checksum);
+        checksum
+    }    
 
     fn build_cipher_internal(key: &[u8], ctr: &[u8]) -> aes_ctr::Aes256Ctr {
         aes_ctr::Aes256Ctr::new(
@@ -158,22 +230,48 @@ impl AdnlHandshake {
     pub fn build_packet(
         buf: &mut Vec<u8>, 
         local: &Arc<dyn KeyOption>,
-        other: &Arc<dyn KeyOption>
+        other: &Arc<dyn KeyOption>,
+        version: Option<u16>
     ) -> Result<()> {
+        let checksum = AdnlCryptoUtils::encode_header(
+            buf, 
+            other.id().data(), 
+            Some(local.pub_key()?.try_into()?), 
+            version
+        );
+        let hdr = if version.is_some() {
+            100
+        } else {
+            96
+        };
+/*
         let checksum = sha256_digest(buf);
         let len = buf.len();
-        buf.resize(len + 96, 0);
-        buf[..].copy_within(..len, 96);
+        let hdr = if version.is_some() {
+            100
+        } else {
+            96
+        };
+        buf.resize(len + hdr, 0);
+        buf[..].copy_within(..len, hdr);
         buf[..32].copy_from_slice(other.id().data());
         buf[32..64].copy_from_slice(local.pub_key()?);
-        buf[64..96].copy_from_slice(&checksum);
+        let idx = if let Some(version) = version {
+            let version = AdnlCryptoUtils::encode_version(version, &buf[..64], &checksum);
+            buf[64..68].copy_from_slice(&version);
+            68
+        } else {
+            64
+        };
+        buf[idx..hdr].copy_from_slice(&checksum);
+*/
         let mut shared_secret = local.shared_secret(
             other.pub_key()?.try_into()?
         )?;
         Self::build_packet_cipher(
             &mut shared_secret,
             &checksum
-        ).apply_keystream(&mut buf[96..]);
+        ).apply_keystream(&mut buf[hdr..]);
         Ok(())
     }
 
@@ -182,21 +280,67 @@ impl AdnlHandshake {
     pub fn parse_packet(
         keys: &lockfree::map::Map<Arc<KeyId>, Arc<dyn KeyOption>>, 
         buf: &mut Vec<u8>, 
-        len: Option<usize>
-    ) -> Result<Option<Arc<KeyId>>> {
+        len: Option<usize>,
+        accept_versioning: bool
+    ) -> Result<(Option<Arc<KeyId>>, Option<u16>)> {
+
+        fn process(
+            buf: &mut Vec<u8>, 
+            secret: &mut [u8; 32], 
+            range: &Range<usize>,
+            version: &Option<u16>
+        ) -> Result<()> {
+            if range.start < 32 {
+                fail!("INERNAL ERROR: bad range");
+            }
+            AdnlHandshake::build_packet_cipher(
+                secret,
+                buf[(range.start - 32)..range.start].try_into()?
+            ).apply_keystream(&mut buf[range.start..range.end]);
+            if !AdnlCryptoUtils::calc_checksum(
+                version, 
+                &buf[range.start..range.end]
+            ).eq(&buf[(range.start - 32)..range.start]) {
+                fail!("Bad handshake packet checksum, version {:?}", version);
+            }
+            buf.drain(0..range.start);
+            Ok(())
+        }
+
         if buf.len() < 96 + len.unwrap_or(0) {
             fail!("Bad handshake packet length: {}", buf.len());
         }
         for key in keys.iter() {
             if key.val().id().data().eq(&buf[0..32]) {
-                let mut shared_secret = key.val().shared_secret(
-                    buf[32..64].try_into()?
-                )?;
-                let range = if let Some(len) = len {
+                let mut range = if let Some(len) = len {
                     96..96 + len
                 } else {
                     96..buf.len()
                 };
+                if accept_versioning && (buf.len() >= 100) {
+                    if let Some(version) = AdnlCryptoUtils::decode_version(
+                        &buf[64..68].try_into()?,
+                        &buf[..64], 
+                        &buf[68..100]
+                    ) {
+                        range.start += 4;
+                        let mut shared_secret = key.val().shared_secret(
+                            buf[32..64].try_into()?
+                        )?;
+                        let mut tmp = Vec::with_capacity(buf.len() - range.end + range.start);
+                        tmp.extend_from_slice(&buf[range.start..range.end]);
+                        let version = Some(version);
+                        if process(buf, &mut shared_secret, &range, &version).is_ok() {
+                            return Ok((Some(key.key().clone()), version))
+                        }
+                        buf[range.start..range.end].copy_from_slice(&tmp);
+                    }
+                }
+                let mut shared_secret = key.val().shared_secret(
+                    buf[32..64].try_into()?
+                )?;
+                process(buf, &mut shared_secret, &range, &None)?;
+/*
                 Self::build_packet_cipher(
                     &mut shared_secret,
                     buf[64..96].try_into()?
@@ -205,10 +349,11 @@ impl AdnlHandshake {
                     fail!("Bad handshake packet checksum");
                 }
                 buf.drain(0..96);
-                return Ok(Some(key.key().clone()));
+*/
+                return Ok((Some(key.key().clone()), None));
             }
         }
-        Ok(None)
+        Ok((None, None))
     }
 
     #[cfg(any(feature = "client", feature = "node", feature = "server"))]

@@ -32,7 +32,10 @@ use rand::Rng;
 use std::{
     cmp::{max, min, Ordering}, collections::VecDeque, fmt::{self, Debug, Display, Formatter}, 
     convert::TryInto, io::{Cursor, ErrorKind}, net::{IpAddr, Ipv4Addr, SocketAddr}, 
-    sync::{Arc, Condvar, Mutex, atomic::{self, AtomicI32, AtomicU32, AtomicU64, AtomicUsize}},
+    sync::{
+        Arc, Condvar, Mutex, 
+        atomic::{self, AtomicI32, AtomicU32, AtomicU64, AtomicUsize}
+    },
     time::{Duration, Instant}, thread
 };
 #[cfg(feature = "dump")]
@@ -404,42 +407,101 @@ impl AdnlChannel {
         hash(object)
     }
 
-    fn decrypt(buf: &mut Vec<u8>, side: &SubchannelSide) -> Result<()> {
+    fn decrypt(buf: &mut Vec<u8>, side: &SubchannelSide) -> Result<Option<u16>> {
+
+        fn process(
+            buf: &mut Vec<u8>, 
+            side: &SubchannelSide, 
+            offset: usize,
+            version: &Option<u16>
+        ) -> Result<()> {
+            if offset < 32 {
+                fail!("INERNAL ERROR: bad offset");
+            }
+            AdnlChannel::process_data(buf, &side.secret, offset)?;
+            if !AdnlCryptoUtils::calc_checksum(
+                version,
+                &buf[offset..]
+            ).eq(&buf[(offset - 32)..offset]) {
+                fail!("Bad channel message checksum, offset {}", offset);
+            }
+            buf.drain(0..offset);
+            Ok(())
+        }
+
+
         if buf.len() < 64 {
             fail!("Channel message is too short: {}", buf.len())
         }
-        Self::process_data(buf, &side.secret)?;
-        if !sha256_digest(&buf[64..]).eq(&buf[32..64]) {
-            fail!("Bad channel message checksum");
+        if buf.len() >= 68 {
+            if let Some(version) = AdnlCryptoUtils::decode_version(
+                &buf[32..36].try_into()?,
+                &buf[..32], 
+                &buf[36..68]
+            ) {
+                let mut tmp = Vec::with_capacity(buf.len() - 68);
+                tmp.extend_from_slice(&buf[68..]);
+                let version = Some(version);
+                if process(buf, side, 68, &version).is_ok() {
+                    return Ok(version)
+                }
+                buf[68..].copy_from_slice(&tmp);
+            }
         }
-        buf.drain(0..64);
-        Ok(())
+        process(buf, side, 64, &None)?;
+        Ok(None)
+
     }
 
-    fn decrypt_ordinary(&self, buf: &mut Vec<u8>) -> Result<()> {
+    fn decrypt_ordinary(&self, buf: &mut Vec<u8>) -> Result<Option<u16>> {
         Self::decrypt(buf, &self.recv.ordinary)
     }
 
-    fn decrypt_priority(&self, buf: &mut Vec<u8>) -> Result<()> {
+    fn decrypt_priority(&self, buf: &mut Vec<u8>) -> Result<Option<u16>> {
         Self::decrypt(buf, &self.recv.priority)
     }
 
-    fn encrypt(buf: &mut Vec<u8>, side: &SubchannelSide) -> Result<()> {
+    fn encrypt(buf: &mut Vec<u8>, side: &SubchannelSide, version: Option<u16>) -> Result<()> {
+        AdnlCryptoUtils::encode_header(buf, &side.id, None, version);
+/*        
         let checksum = sha256_digest(buf);
         let len = buf.len();
-        buf.resize(len + 64, 0);
-        buf[..].copy_within(..len, 64);
+        let hdr = if version.is_some() {
+            68
+        } else {
+            64
+        };
+        buf.resize(len + hdr, 0);
+        buf[..].copy_within(..len, hdr);
         buf[..32].copy_from_slice(&side.id);
-        buf[32..64].copy_from_slice(&checksum);
-        Self::process_data(buf, &side.secret)
+        let idx = if let Some(version) = version {
+            let version = AdnlCryptoUtils::encode_version(version, &side.id, &checksum);
+            buf[32..36].copy_from_slice(&version);
+            36
+        } else {
+            32
+        };
+        buf[idx..hdr].copy_from_slice(&checksum);
+*/
+        //dump!(info, TARGET, "secret ->", &side.secret);
+        let ret = Self::process_data(
+            buf, 
+            &side.secret, 
+            if version.is_some() {
+                68
+            } else {
+                64
+            }
+        );
+        ret
     }
 
-    fn encrypt_ordinary(&self, buf: &mut Vec<u8>) -> Result<()> { 
-        Self::encrypt(buf, &self.send.ordinary)
+    fn encrypt_ordinary(&self, buf: &mut Vec<u8>, version: Option<u16>) -> Result<()> {
+        Self::encrypt(buf, &self.send.ordinary, version)
     }
 
-    fn encrypt_priority(&self, buf: &mut Vec<u8>) -> Result<()> { 
-        Self::encrypt(buf, &self.send.priority)
+    fn encrypt_priority(&self, buf: &mut Vec<u8>, version: Option<u16>) -> Result<()> { 
+        Self::encrypt(buf, &self.send.priority, version)
     }
 
     fn ordinary_recv_id(&self) -> &ChannelId {
@@ -454,11 +516,14 @@ impl AdnlChannel {
         &self.recv.priority.id
     }
 
-    fn process_data(buf: &mut Vec<u8>, secret: &[u8; 32]) -> Result<()> {
+    fn process_data(buf: &mut Vec<u8>, secret: &[u8; 32], offset: usize) -> Result<()> {
+        if offset < 32 {
+            fail!("INTERNAL ERROR: bad offset of data to process")
+        }
         AdnlCryptoUtils::build_cipher_secure(
             secret, 
-            buf[32..64].try_into()?
-        ).apply_keystream(&mut buf[64..]);
+            buf[(offset - 32)..offset].try_into()?
+        ).apply_keystream(&mut buf[offset..]);
         Ok(())
     }
 
@@ -803,7 +868,7 @@ impl DataCompression {
             zstd::stream::copy_encode(Cursor::new(&len_bytes), &mut ret, Self::COMPRESSION_LEVEL)?;
             let mut ret = ret.into_inner();
             let compressed = ret.len();
-            log::info!(target: TARGET, "Compression: {} -> {}", uncompressed, compressed);
+            log::debug!(target: TARGET, "Compression: {} -> {}", uncompressed, compressed);
             ret.push(Self::TAG_COMPRESSED);
             Ok(ret)
         }
@@ -811,8 +876,8 @@ impl DataCompression {
 
     pub fn decompress(data: &[u8]) -> Option<Vec<u8>> {
         let len = data.len();
-        if len == 0 {
-            log::debug!(target: TARGET, "Too short input data for decompression");
+        if len <= 5 {
+            log::debug!(target: TARGET, "Too short input data ({}) for decompression", len);
             None
         } else {
             match data[len - 1] {
@@ -833,6 +898,10 @@ impl DataCompression {
                                 if src_len != len - 4 {
                                     None
                                 } else {
+                                    log::debug!(
+                                        target: TARGET, "Decompression: {} -> {}", 
+                                        data.len(), src_len
+                                    );
                                     ret.truncate(src_len);
                                     Some(ret)
                                 } 
@@ -840,7 +909,7 @@ impl DataCompression {
                         }
                     },
                 x => {
-                    log::debug!(target: TARGET, "Bad compression tag {:x}", x);
+                    log::debug!(target: TARGET, "Bad compression tag {:x}, len {}", x, len);
                     None
                 }
             }
@@ -2002,8 +2071,11 @@ impl Drop for AdnlNode {
 impl AdnlNode {
 
     /// ADNL options
-    pub const OPTION_FORCE_VERSIONING:  u32 = 0x0001; // Force protocol versioning
-    pub const OPTION_FORCE_COMPRESSION: u32 = 0x0002; // Force traffic compression
+    pub const OPTION_FORCE_COMPRESSION: u32 = 0x0001; // Force traffic compression
+    pub const OPTION_FORCE_VERSIONING:  u32 = 0x0002; // Force ADNL versioning
+
+    /// ADNL versions
+    const VERSION_INITIAL: u16 = 0x0000;
 
     const CLOCK_TOLERANCE_SEC: i32 = 60; 
     const MAX_ADNL_MESSAGE: usize = 1024;
@@ -3354,12 +3426,12 @@ impl AdnlNode {
         buf: &mut Vec<u8>,
         channel: &Arc<AdnlChannel>,
         priority: bool
-    ) -> Result<()> {
-        if priority {
+    ) -> Result<Option<u16>> {
+        let version = if priority {
             channel.decrypt_priority(buf)?
         } else {
             channel.decrypt_ordinary(buf)?
-        }
+        };
         // Ensure both sides of channel established
         if channel.flags.load(atomic::Ordering::Relaxed) & AdnlChannel::ESTABLISHED == 0 {
             let peers = self.peers(&channel.local_key)?;
@@ -3375,7 +3447,7 @@ impl AdnlNode {
             AdnlChannel::ESTABLISHED | AdnlChannel::SEQNO_RESET, 
             atomic::Ordering::Relaxed
         );
-        Ok(())
+        Ok(version)
     }
 
     fn drop_receive_subchannels(
@@ -3672,13 +3744,14 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
         let received_len = packet.buf.len();
 #[cfg(feature = "debug")]
 println!("RECV {}", received_len);
-        let (priority, local_key, channel) = match &subchannel {
-            Subchannel::None => if let Some(local_key) = AdnlHandshake::parse_packet(
+        let (priority, local_key, channel, version) = match &subchannel {
+            Subchannel::None => if let (Some(local_key), version) = AdnlHandshake::parse_packet(
                 &self.config.keys, 
                 &mut packet.buf, 
-                None
+                None,
+                true
             )? {
-                (false, local_key, None)
+                (false, local_key, None, version)
             } else {
                 log::trace!(
                     target: TARGET,
@@ -3690,14 +3763,19 @@ println!("RECV {}", received_len);
                 return Ok(())
             },
             Subchannel::Ordinary(channel) => {
-                self.decrypt_packet_from_channel(&mut packet.buf, &channel, false)?;
-                (false, channel.local_key.clone(), Some(channel))
+                let version = self.decrypt_packet_from_channel(&mut packet.buf, &channel, false)?;
+                (false, channel.local_key.clone(), Some(channel), version)
             },
             Subchannel::Priority(channel) => {
-                self.decrypt_packet_from_channel(&mut packet.buf, &channel, true)?;
-                (true, channel.local_key.clone(), Some(channel))
+                let version = self.decrypt_packet_from_channel(&mut packet.buf, &channel, true)?;
+                (true, channel.local_key.clone(), Some(channel), version)
             }
         };
+        if let Some(version) = version {
+            if version != AdnlNode::VERSION_INITIAL {
+                fail!("Unsupported ADNL version {}", version)
+            }
+        }
         let pkt = deserialize_boxed(&packet.buf[..])?
             .downcast::<AdnlPacketContentsBoxed>()
             .map_err(|pkt| error!("Unsupported ADNL packet format {:?}", pkt))?
@@ -4075,15 +4153,20 @@ println!("RECV {}", received_len);
                 )?;
             }
         }
+        let version = if self.check_options(Self::OPTION_FORCE_VERSIONING) {
+            Some(Self::VERSION_INITIAL)
+        } else {
+            None
+        }; 
         if let Some(channel) = channel {
             if priority {
-                channel.encrypt_priority(&mut data)?;
+                channel.encrypt_priority(&mut data, version)?;
             } else {
-                channel.encrypt_ordinary(&mut data)?;
+                channel.encrypt_ordinary(&mut data, version)?;
             }
         } else {
             let key = Ed25519KeyOption::generate()? as Arc<dyn KeyOption>;
-            AdnlHandshake::build_packet(&mut data, &key, &peer.address.key)?;
+            AdnlHandshake::build_packet(&mut data, &key, &peer.address.key, version)?;
         }
         log::trace!(
             target: TARGET,

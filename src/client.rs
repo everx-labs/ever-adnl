@@ -204,12 +204,13 @@ impl AdnlClient {
         let nonce = buf.as_slice().try_into()?;
         let ret = AdnlStreamCrypto::with_nonce_as_client(nonce);
         if let Some(client_key) = &config.client_key {
-            AdnlHandshake::build_packet(&mut buf, client_key, &config.server_key)?
+            AdnlHandshake::build_packet(&mut buf, client_key, &config.server_key, None)?
         } else {
             AdnlHandshake::build_packet(
                 &mut buf, 
                 &Ed25519KeyOption::generate()?,
-                &config.server_key
+                &config.server_key,
+                None
             )?
         }
         stream.write(&mut buf).await?;

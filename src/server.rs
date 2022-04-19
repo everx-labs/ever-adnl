@@ -181,9 +181,13 @@ impl AdnlServerThread {
         buf: &mut Vec<u8>
     ) -> Result<(AdnlStreamCrypto, AdnlPeers)> {
         let other_key = buf[32..64].try_into()?;
-        let local_key = AdnlHandshake::parse_packet(key, buf, Some(160))?.ok_or_else(
+        let (local_key, version) = AdnlHandshake::parse_packet(key, buf, Some(160), false)?;
+        let local_key = local_key.ok_or_else(
             || error!("Unknown ADNL server key, cannot decrypt")
         )?;
+        if version.is_some() {
+            fail!("Unsupported ADNL versioning {} in TCP connection")
+        }
         let other_key = Ed25519KeyOption::from_public_key(&other_key).id().clone();
         dump!(trace, TARGET, "Nonce", &buf[..160]);
         let nonce: &mut [u8; 160] = buf.as_mut_slice().try_into()?;
