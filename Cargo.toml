@@ -3,7 +3,7 @@ build = './common/build/build.rs'
 description = 'ADNL library'
 edition = '2018'
 name = 'adnl'
-version = '0.7.75'
+version = '0.7.76'
 
 [workspace]
 
@@ -23,13 +23,13 @@ socket2 = '0.3.19'
 stream-cancel = '0.8.0'
 tokio-io-timeout = '1.1.1'
 x25519-dalek = '1.2'
-ever-crypto = { git = 'https://github.com/tonlabs/ever-labs-crypto.git', tag = '0.1.29' }
+ever-crypto = { git = 'https://github.com/tonlabs/ever-labs-crypto.git', tag = '0.1.33' }
 external-ip = { optional = true, version = '4.1.0' }
 lockfree = { git = 'https://github.com/tonlabs/lockfree.git' }
 serde = { features = [ 'derive', 'rc' ], version = '1.0.105' }
 tokio = { features = [ 'io-util', 'macros', 'net', 'rt-multi-thread' ], version = '1.5.0' }
 tokio-stream = { features = [ 'net' ], version = '0.1.4' }
-ton_api = { git = 'https://github.com/tonlabs/ton-labs-tl.git', package = 'ton_api', tag = '0.2.129' }
+ton_api = { git = 'https://github.com/tonlabs/ton-labs-tl.git', package = 'ton_api', tag = '0.2.130' }
 ton_types = { git = 'https://github.com/tonlabs/ton-labs-types.git', tag = '1.11.3' }
 zstd = { features = [ 'pkg-config' ], version = '0.11' }
 
