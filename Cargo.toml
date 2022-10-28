@@ -24,7 +24,7 @@ stream-cancel = '0.8.0'
 tokio-io-timeout = '1.1.1'
 x25519-dalek = '1.2'
 chrono = { optional = true, version = '0.4' }
-ever-crypto = { git = 'https://github.com/tonlabs/ever-labs-crypto.git', tag = '0.1.47' }
+ever-crypto = { git = 'https://github.com/tonlabs/ever-labs-crypto.git', tag = '0.1.48' }
 external-ip = { optional = true, version = '4.1.0' }
 lockfree = { git = 'https://github.com/tonlabs/lockfree.git' }
 serde = { features = [ 'derive', 'rc' ], version = '1.0.105' }
