@@ -1,5 +1,5 @@
 /*
-* Copyright (C) 2019-2021 TON Labs. All Rights Reserved.
+* Copyright (C) 2019-2022 TON Labs. All Rights Reserved.
 *
 * Licensed under the SOFTWARE EVALUATION License (the "License"); you may not use
 * this file except in compliance with the License.
@@ -654,7 +654,7 @@ impl Query {
                 answer,
                 |answer| TaggedAdnlMessage {
                     object: AdnlAnswerMessage {
-                        query_id: query.query_id,  
+                        query_id: query.query_id.clone(),
                         answer: ton::bytes(answer.object)
                     }.into_boxed(),
                     #[cfg(feature = "telemetry")]
@@ -691,7 +691,7 @@ impl Query {
                 answer, 
                 |answer| TaggedRldpAnswer {
                     object: RldpAnswer {
-                        query_id: query.query_id,  
+                        query_id: query.query_id.clone(),
                         data: ton::bytes(answer.object)
                     },
                     #[cfg(feature = "telemetry")]

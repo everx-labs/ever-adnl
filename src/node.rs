@@ -3608,7 +3608,7 @@ log::warn!(target: TARGET, "On recv confirm channel in {}", channel.local_key);
                 let msg = if let Some(local_pub) = local_pub {
                     ConfirmChannel {
                         key: UInt256::with_array(local_pub),
-                        peer_key: create.key,
+                        peer_key: create.key.clone(),
                         date: create.date
                     }.into_boxed()
                 } else {
