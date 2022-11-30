@@ -20,3 +20,4 @@ pub mod server;
 pub mod node;
 pub mod telemetry;
 
+include!("../common/src/info.rs");
