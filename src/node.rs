@@ -3504,7 +3504,7 @@ impl AdnlNode {
 
     async fn process_message(
         &self,
-        subscribers: &Vec<Arc<dyn Subscriber>>,
+        subscribers: &[Arc<dyn Subscriber>],
         msg: AdnlMessage,
         peers: &AdnlPeers,
         priority: bool
@@ -3669,7 +3669,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
     }
 
     async fn process_query(
-        subscribers: &Vec<Arc<dyn Subscriber>>,
+        subscribers: &[Arc<dyn Subscriber>],
         query: &AdnlQueryMessage,
         peers: &AdnlPeers
     ) -> Result<Option<TaggedAdnlMessage>> {
@@ -3738,7 +3738,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
         &self, 
         packet: &mut PacketBuffer,
         subchannel: Subchannel,
-        subscribers: &Vec<Arc<dyn Subscriber>>,
+        subscribers: &[Arc<dyn Subscriber>],
     ) -> Result<()> {
         #[cfg(feature = "telemetry")]
         let received_len = packet.buf.len();

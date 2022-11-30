@@ -11,10 +11,8 @@
 * limitations under the License.
 */
 
-use crate::{
-    common::{
-        AdnlHandshake, AdnlStream, AdnlStreamCrypto, Query, TaggedTlObject, Timeouts
-    }
+use crate::common::{
+    AdnlHandshake, AdnlStream, AdnlStreamCrypto, Query, TaggedTlObject, Timeouts
 };
 use ever_crypto::{Ed25519KeyOption, KeyOption, KeyOptionJson};
 use rand::Rng;

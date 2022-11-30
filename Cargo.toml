@@ -1,7 +1,7 @@
 [package]
 build = './common/build/build.rs'
 description = 'ADNL library'
-edition = '2018'
+edition = '2021'
 name = 'adnl'
 version = '0.7.105'
 
