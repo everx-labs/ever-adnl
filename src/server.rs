@@ -127,7 +127,7 @@ impl AdnlServerThread {
         tokio::spawn(
             async move {
                 if let Err(e) = AdnlServerThread::run(stream, key, clients, subscribers).await {
-                    log::warn!(target: TARGET, "ERROR --> {}", e);
+                    log::warn!(target: TARGET, "ADNL server ERROR --> {}", e);
                     return;
                 }
                 unreachable!();

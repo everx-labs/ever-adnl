@@ -3241,7 +3241,7 @@ impl AdnlNode {
             if *reinit_date > Version::get() + Self::CLOCK_TOLERANCE_SEC {
                 fail!("Source reinit date is too new: {}", reinit_date)
             }
-            let other_reinit_date = peer.send_state.reinit_date();
+            //let other_reinit_date = peer.send_state.reinit_date();
             if !peer.try_reinit(*reinit_date).await? {
                 fail!("Source reinit date is too old: {}", reinit_date)
             }
@@ -3277,7 +3277,7 @@ impl AdnlNode {
                     fail!(
                         "Destination reinit date is too old: {} vs {}, {:?}", 
                         dst_reinit_date, 
-                        other_reinit_date,  
+                        local_reinit_date,  
                         packet
                     )
                 }
