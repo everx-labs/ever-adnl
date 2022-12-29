@@ -56,26 +56,40 @@ impl AveragePerPeriod {
         let period = self.history.len() as u64;
         let mut count = 0;
         let mut value = 0;
+        let mut delta = 0;
         let mut index = self.index.load(Ordering::Relaxed) as usize;
         for offset in 0..period {
             let stamp = self.history[index].stamp.load(Ordering::Relaxed);
-            // Exclude tail second if needed
-            if elapsed - stamp >= period {
-                break
-            }
-            if elapsed - stamp > offset {
-                count += 1
+            if elapsed < stamp {
+                // Exclude races in index
+                if (stamp - elapsed > 1) || (offset != 0) {
+                    log::error!(
+                        target: TARGET_TELEMETRY, 
+                        "Failure in telemetry average: {} vs {} in {}", elapsed, stamp, offset
+                    );
+                    return 0; 
+                }
+                delta = 1;
             } else {
+                // Exclude tail second if needed
+                if elapsed - stamp >= period {
+                    break
+                }
+                // Consider missing second
+                if elapsed - stamp > offset - delta {
+                    count += 1;
+                    continue
+                } 
                 // Exclude ongoing second
                 if elapsed > stamp {
                     count += self.history[index].count.load(Ordering::Relaxed);
                     value += self.history[index].value.load(Ordering::Relaxed);
                 }
-                index = if index == 0 {
-                    period as usize - 1
-                } else {
-                    index - 1
-                }
+            }
+            index = if index == 0 {
+                period as usize - 1
+            } else {
+                index - 1
             }
         }
         if count == 0 {
