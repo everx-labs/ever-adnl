@@ -2077,6 +2077,15 @@ impl AdnlNode {
     /// ADNL versions
     const VERSION_INITIAL: u16 = 0x0000;
 
+    const MASK_STOP: u32        = 0x80000000;
+    const MASK_LOOPBACK: u32    = 0x00000001;
+    const MASK_RECV: u32        = 0x00000002;
+    const MASK_SEND: u32        = 0x00000004;
+    const MASK_SUBSCRIBERS: u32 = 0x00000008;
+    const MASK_WATCHDOG:    u32 = 0x00000010;
+    #[cfg(feature = "dump")]                                
+    const MASK_DUMP: u32        = 0x00000020;
+
     const CLOCK_TOLERANCE_SEC: i32 = 60; 
     const MAX_ADNL_MESSAGE: usize = 1024;
     const MAX_PACKETS_IN_PROGRESS: u64 = 512;
@@ -2263,12 +2272,13 @@ impl AdnlNode {
 //        let socket_send = Arc::new(socket_send);
         subscribers.push(Arc::new(AdnlPingSubscriber));
         // Subscribers poll
+        node.stop.fetch_or(Self::MASK_SUBSCRIBERS, atomic::Ordering::Relaxed);
         let start = Arc::new(Instant::now());
         let subscribers = Arc::new(subscribers);
         let subscribers_local = subscribers.clone();
         let subscribers_stop = Arc::new(AtomicU32::new(0));
         for subscriber in subscribers.iter() {
-            let node_subs = node.clone();
+            let node_stop = node.stop.clone();
             let start = start.clone();
             let subscriber = subscriber.clone();
             let subscribers_stop = subscribers_stop.clone();
@@ -2279,14 +2289,14 @@ impl AdnlNode {
                         tokio::time::sleep(
                             Duration::from_millis(Self::TIMEOUT_QUERY_STOP_MS)
                         ).await;
-                        if node_subs.stop.load(atomic::Ordering::Relaxed) > 0 {      
+                        if (node_stop.load(atomic::Ordering::Relaxed) & Self::MASK_STOP) != 0 {
                             break
                         }  
                         subscriber.poll(&start).await;
                     }
                     if subscribers_stop.fetch_sub(1, atomic::Ordering::Relaxed) == 1 {
-                        node_subs.stop.fetch_add(1, atomic::Ordering::Relaxed);                                                                                                         
-                        log::warn!(target: TARGET, "Node subscriber poll exited");
+                        node_stop.fetch_and(!Self::MASK_SUBSCRIBERS, atomic::Ordering::Relaxed);
+                        log::warn!(target: TARGET, "Node subscriber poll stopped");
                     }
                 }
             );
@@ -2306,6 +2316,7 @@ impl AdnlNode {
                 let mut monitor_queries: Vec<(u128, QueryId)> = Vec::new();
                 #[cfg(feature = "telemetry")] 
                 let mut last_check = Instant::now();
+                node_stop.stop.fetch_or(Self::MASK_WATCHDOG, atomic::Ordering::Relaxed);
                 loop {
                     tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_QUERY_STOP_MS)).await;
                     #[cfg(feature = "telemetry")] {
@@ -2330,7 +2341,7 @@ impl AdnlNode {
                             last_check = Instant::now();
                         }
                     }
-                    if node_stop.stop.load(atomic::Ordering::Relaxed) > 0 {      
+                    if (node_stop.stop.load(atomic::Ordering::Relaxed) & Self::MASK_STOP) != 0 {
                         node_stop.send_pipeline.shutdown();
                         let stop = (
                             AdnlMessage::Adnl_Message_Nop,
@@ -2394,8 +2405,8 @@ impl AdnlNode {
                         monitor_queries.insert(insert, (elapsed, query_id));
                     }
                 }
-                node_stop.stop.fetch_add(1, atomic::Ordering::Relaxed);                                                                                                         
-                log::warn!(target: TARGET, "Node stopping watchdog exited");
+                node_stop.stop.fetch_and(!Self::MASK_WATCHDOG, atomic::Ordering::Relaxed);
+                log::warn!(target: TARGET, "Node stopping watchdog stopped");
             }
         );
         // Remote connections
@@ -2403,8 +2414,9 @@ impl AdnlNode {
         thread::spawn(
             move || {
                 let mut buf = [0u8; Self::SIZE_BUFFER];
+                node_recv.stop.fetch_or(Self::MASK_RECV, atomic::Ordering::Relaxed);
                 loop {
-                    if node_recv.stop.load(atomic::Ordering::Relaxed) > 0 {
+                    if (node_recv.stop.load(atomic::Ordering::Relaxed) & Self::MASK_STOP) != 0 {
                         break
                     }
                     let len = match socket_recv.recv(&mut buf[..]) {
@@ -2441,8 +2453,8 @@ impl AdnlNode {
                     );
                     recv_pipeline.clone().put(packet, subchannel);
                 }
-                node_recv.stop.fetch_add(1, atomic::Ordering::Relaxed);
-                log::warn!(target: TARGET, "Node socket receiver exited");
+                node_recv.stop.fetch_and(!Self::MASK_RECV, atomic::Ordering::Relaxed);
+                log::warn!(target: TARGET, "Node socket receiver stopped");
             }
         );
         let node_send = node.clone();
@@ -2451,6 +2463,7 @@ impl AdnlNode {
                 const PERIOD_NANOS: u128 = 1000000;
                 let start_history = Instant::now();
                 let mut history = None;
+                node_send.stop.fetch_or(Self::MASK_SEND, atomic::Ordering::Relaxed);
                 loop {
                     let job = node_send.send_pipeline.get();
                     let (job, stop) = match job {
@@ -2509,22 +2522,23 @@ impl AdnlNode {
                     }
                     #[cfg(feature = "telemetry")] 
                     node_send.telemetry.send_sock.update(1);
-                    if node_send.stop.load(atomic::Ordering::Relaxed) > 0 {
+                    if (node_send.stop.load(atomic::Ordering::Relaxed) & Self::MASK_STOP) != 0 {
                         if stop {
                             break
                         }
                     }
                 }
-                node_send.stop.fetch_add(1, atomic::Ordering::Relaxed);
-                log::warn!(target: TARGET, "Node socket sender exited");
+                node_send.stop.fetch_and(!Self::MASK_SEND, atomic::Ordering::Relaxed);
+                log::warn!(target: TARGET, "Node socket sender stopped");
             }
         );
         // Local connections
         let node_loop = node.clone();
         tokio::spawn(
             async move {
+                node_loop.stop.fetch_or(Self::MASK_LOOPBACK, atomic::Ordering::Relaxed);
                 while let Some((msg, src)) = queue_send_loopback_reader.recv().await {
-                    if node_loop.stop.load(atomic::Ordering::Relaxed) > 0 {
+                    if (node_loop.stop.load(atomic::Ordering::Relaxed) & Self::MASK_STOP) != 0 {
                         break
                     }
                     let query = match msg {
@@ -2565,14 +2579,14 @@ impl AdnlNode {
                     );
                 }
                 Self::graceful_close(queue_send_loopback_reader).await;
-                node_loop.stop.fetch_add(1, atomic::Ordering::Relaxed);
-                log::warn!(target: TARGET, "Node loopback exited");
+                node_loop.stop.fetch_and(!Self::MASK_LOOPBACK, atomic::Ordering::Relaxed);
+                log::warn!(target: TARGET, "Node loopback stopped");
             }
         );
         // Traffic dump
         #[cfg(feature = "dump")]
         if let Some(dump) = node.dump.as_ref() {
-            let node_dump = node.clone();
+            let node_stop = node.stop.clone();
             let mut dump_path = PathBuf::from(&dump.path);  
             dump_path.push("alive");
             create_dir_all(&dump_path)?;
@@ -2593,7 +2607,7 @@ impl AdnlNode {
                                     path.join("alive").join(file)
                                 };
                                 if src.exists() {
-                                    rename(src, dst.as_path())?
+                                    rename(src, dst.as_path())?              
                                 }
                             }
                             Ok(dst)
@@ -2606,8 +2620,9 @@ impl AdnlNode {
                             writeln!(file, "{}", msg)?;
                             Ok(())
                         }
+                        node_stop.fetch_or(Self::MASK_DUMP, atomic::Ordering::Relaxed);
                         while let Some(record) = reader.recv().await {
-                            if node_dump.stop.load(atomic::Ordering::Relaxed) > 0 {
+                            if (node_stop.load(atomic::Ordering::Relaxed) & Self::MASK_STOP) != 0 {
                                 break
                             }
                             let file = format!("{}", record.key_id).replace("/", "_");
@@ -2623,8 +2638,8 @@ impl AdnlNode {
                             }
                         }
                         Self::graceful_close(reader).await;
-                        node_dump.stop.fetch_add(1, atomic::Ordering::Relaxed);
-                        log::warn!(target: TARGET, "Node dump exited");
+                        node_stop.fetch_and(!Self::MASK_DUMP, atomic::Ordering::Relaxed);
+                        log::warn!(target: TARGET, "Node dump stopped");
                     }
                 );
             }
@@ -2634,23 +2649,15 @@ impl AdnlNode {
 
     /// Stop node
     pub async fn stop(&self) {
-        log::warn!(target: TARGET, "Stopping ADNL node");
-        self.stop.fetch_add(1, atomic::Ordering::Relaxed);
-        let wait_until = {
-            #[cfg(feature = "dump")]
-            if self.dump.is_some() {
-                7
-            } else {
-                6 
-            }
-            #[cfg(not(feature = "dump"))]
-            6
-        };
+        log::warn!(target: TARGET, "Stopping ADNL node...");
+        self.stop.fetch_or(Self::MASK_STOP, atomic::Ordering::Relaxed);
         loop {
             tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_QUERY_STOP_MS)).await;
-            if self.stop.load(atomic::Ordering::Relaxed) >= wait_until {
+            let stop = self.stop.load(atomic::Ordering::Relaxed);
+            if stop == Self::MASK_STOP {
                 break
             }
+            log::warn!(target: TARGET, "Still stopping ADNL node ({:x})...", stop);
         }
         tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_SHUTDOWN_MS)).await;
         log::warn!(target: TARGET, "ADNL node stopped");
