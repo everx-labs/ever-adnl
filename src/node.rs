@@ -995,6 +995,7 @@ impl Display for IpAddress {
 declare_counted!(
     struct Peer {
         address: AdnlNodeAddress,
+        last_packets: AtomicU32,
         recv_state: PeerState,
         send_state: PeerState
     }
@@ -1537,8 +1538,8 @@ impl RecvPipeline {
         } else  {
             num_cpus::get() as u64
         };
-        if max_workers > AdnlNode::MAX_PACKETS_IN_PROGRESS {
-            max_workers = AdnlNode::MAX_PACKETS_IN_PROGRESS
+        if max_workers > HISTORY_BITS as u64 {
+            max_workers = HISTORY_BITS as u64
         }
         let max_ordinary_workers = if let Some(pool) = adnl.config.recv_priority_pool {
             let max_ordinary_workers = max(1, max_workers * (100 - pool as u64) / 100);
@@ -2088,7 +2089,7 @@ impl AdnlNode {
 
     const CLOCK_TOLERANCE_SEC: i32 = 60; 
     const MAX_ADNL_MESSAGE: usize = 1024;
-    const MAX_PACKETS_IN_PROGRESS: u64 = 512;
+    const MAX_NO_FEEDBACK: u32 = 200;
     const MAX_PRIORITY_ATTEMPTS: u64 = 10;
     const SIZE_BUFFER: usize = 2048;
     const TIMEOUT_ADDRESS_SEC: i32 = 1000;       
@@ -2711,6 +2712,7 @@ impl AdnlNode {
                         let peers = AdnlPeers::with_keys(local_key.clone(), ret.clone());
                         let peer = Peer {
                             address,
+                            last_packets: AtomicU32::new(0),
                             recv_state: PeerState::for_receive_with_reinit_date(
                                 self.start_time,
                                 #[cfg(feature = "telemetry")]
@@ -2896,7 +2898,7 @@ impl AdnlNode {
         let priority_context = self.clone().send_query_with_priority(
             prefix, query, peers, timeout, true
         ).await?;
-
+        
         if let MessageRepeat::Required = priority_context.repeat {
             let ordinary_context = self.clone().send_query_with_priority(
                 prefix, query, peers, timeout, false
@@ -3017,6 +3019,7 @@ impl AdnlNode {
                 |removed| {
                     let peer = Peer {
                         address,
+                        last_packets: AtomicU32::new(0),
                         recv_state: PeerState::for_receive_with_reinit_date(
                             peer.recv_state.reinit_date.load(atomic::Ordering::Relaxed) + 1,
                             #[cfg(feature = "telemetry")]
@@ -3047,7 +3050,7 @@ impl AdnlNode {
     pub fn send_custom(
         &self, 
         data: &TaggedByteSlice, 
-        peers: AdnlPeers,
+        peers: &AdnlPeers,
     ) -> Result<()> {
         let msg = TaggedAdnlMessage {
             object: AdnlCustomMessage {
@@ -3056,7 +3059,7 @@ impl AdnlNode {
             #[cfg(feature = "telemetry")]
             tag: data.tag
         };
-        let (_, repeat) = self.send_message_to_peer(msg, &peers, false)?;
+        let (_, repeat) = self.send_message_to_peer(msg, peers, false)?;
         match repeat {
             MessageRepeat::Unapplicable => Ok(()), 
             x => fail!("INTERNAL ERROR: bad repeat {:?} in ADNL custom message", x)
@@ -3715,7 +3718,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
                 Query::Timeout => if let MessageRepeat::Required = context.repeat {
                     return Ok(None)
                 } else {
-                    /* Monitor channel health */
+                    /* Monitor channel health using queries */
                     if let Some(channel) = &context.channel {
                         let flags = AdnlChannel::ESTABLISHED | AdnlChannel::SEQNO_RESET;
                         let now = Version::get() as u64;
@@ -3823,9 +3826,10 @@ println!("RECV {}", received_len);
             }
         }
         let peers = Arc::new(AdnlPeers::with_keys(local_key, other_key));
-        #[cfg(feature = "telemetry")]
         if let Some(peer) = self.peers(peers.local())?.map_of.get(peers.other()) {
-            peer.val().update_recv_stats(received_len as u64, peers.local())
+            #[cfg(feature = "telemetry")]
+            peer.val().update_recv_stats(received_len as u64, peers.local());
+            peer.val().last_packets.store(0, atomic::Ordering::Relaxed);
         }
         if let Some(msg) = pkt.message { 
             #[cfg(feature = "telemetry")]
@@ -3909,7 +3913,7 @@ println!("RECV {}", received_len);
     fn send_message_to_peer(
         &self, 
         msg: TaggedAdnlMessage, 
-        peers: &AdnlPeers, 
+        adnl_peers: &AdnlPeers, 
         priority: bool
     ) -> Result<(Option<Arc<AdnlChannel>>, MessageRepeat)> {
 
@@ -3941,17 +3945,20 @@ println!("RECV {}", received_len);
 
         log::trace!(target: TARGET, "Send message {:?}", msg.object);
 
-        let src = self.key_by_id(peers.local())?;
-        let dst = peers.other();
-        let peers = self.peers(peers.local())?;
-        let peer = if let Some(peer) = peers.map_of.get(dst) {
-            peer
-        } else {
-            fail!("Unknown peer {}", dst)
-        };
-        let peer = peer.val();
-        let channel = peers.channels_send.get(dst).map(|guard| guard.val().clone());
+        let src = adnl_peers.local();
+        let dst = adnl_peers.other();
+        let peers = self.peers(src)?;
+        let mut peer = peers.map_of.get(dst).ok_or_else(|| error! ("Unknown peer {}", dst))?;
+        if peer.val().last_packets.load(atomic::Ordering::Relaxed) > Self::MAX_NO_FEEDBACK {
+            // Reset channel when using messages only and no feedack from peer
+            log::warn!(target: TARGET, "Reset channel {} -> {} due to absent feedback", src, dst);
+            self.reset_peers(adnl_peers)?;
+            peer = peers.map_of.get(dst).ok_or_else(|| error! ("Unknown peer {}", dst))?;
+        }
 
+        let peer = peer.val();
+        let src = self.key_by_id(src)?;
+        let channel = peers.channels_send.get(dst).map(|guard| guard.val().clone());
         let create_channel_msg = if channel.is_none() && peers.channels_wait.get(dst).is_none() {
             log::debug!(target: TARGET, "Create channel {} -> {}", src.id(), dst);
             let pub_key = peer.address.channel_key.pub_key()?;
@@ -4053,7 +4060,7 @@ println!("RECV {}", received_len);
             repeat
         };
         Ok((channel, repeat))
-
+      
     }
 
     fn send_packet(
@@ -4213,7 +4220,9 @@ println!("RECV {}", received_len);
         } else {
             self.send_pipeline.put_ordinary(SendJob::Data(job))
         }
+        peer.last_packets.fetch_add(1, atomic::Ordering::Relaxed);
         Ok(repeat)
+
     }
 
     async fn update_query(

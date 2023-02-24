@@ -15,7 +15,8 @@ use aes_ctr::cipher::stream::{NewStreamCipher, SyncStreamCipher};
 use core::ops::Range;
 use ever_crypto::{KeyId, Sha2, sha256_digest};
 #[cfg(any(feature = "client", feature = "server", feature = "node"))]
-use ever_crypto::KeyOption;use rand::Rng;
+use ever_crypto::KeyOption;
+use rand::Rng;
 use std::{
     fmt::Debug, hash::Hash, sync::{Arc, atomic::{AtomicU64, AtomicUsize, Ordering}},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH}
