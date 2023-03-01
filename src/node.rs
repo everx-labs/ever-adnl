@@ -2089,7 +2089,7 @@ impl AdnlNode {
 
     const CLOCK_TOLERANCE_SEC: i32 = 60; 
     const MAX_ADNL_MESSAGE: usize = 1024;
-    const MAX_NO_FEEDBACK: u32 = 200;
+//    const MAX_NO_FEEDBACK: u32 = 200;
     const MAX_PRIORITY_ATTEMPTS: u64 = 10;
     const SIZE_BUFFER: usize = 2048;
     const TIMEOUT_ADDRESS_SEC: i32 = 1000;       
@@ -3948,6 +3948,8 @@ println!("RECV {}", received_len);
         let src = adnl_peers.local();
         let dst = adnl_peers.other();
         let peers = self.peers(src)?;
+        let peer = peers.map_of.get(dst).ok_or_else(|| error! ("Unknown peer {}", dst))?;
+/*
         let mut peer = peers.map_of.get(dst).ok_or_else(|| error! ("Unknown peer {}", dst))?;
         if peer.val().last_packets.load(atomic::Ordering::Relaxed) > Self::MAX_NO_FEEDBACK {
             // Reset channel when using messages only and no feedack from peer
@@ -3955,6 +3957,7 @@ println!("RECV {}", received_len);
             self.reset_peers(adnl_peers)?;
             peer = peers.map_of.get(dst).ok_or_else(|| error! ("Unknown peer {}", dst))?;
         }
+*/
 
         let peer = peer.val();
         let src = self.key_by_id(src)?;
