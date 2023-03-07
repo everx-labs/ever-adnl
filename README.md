@@ -32,6 +32,11 @@ cargo build --release
 
 This project output is the library which is used as a part of Everscale/Venom node. Also it can be used in standalone tools.
 
+## Tags
+
+`blockchain` `everscale` `rust` `venom-blockchain` `venom-developer-program` `venom-network` 
+
+
 ## Contributing
 
 Contribution to the project is expected to be done via pull requests submission.
