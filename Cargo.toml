@@ -3,7 +3,7 @@ build = './common/build/build.rs'
 description = 'ADNL library'
 edition = '2021'
 name = 'adnl'
-version = '0.7.143'
+version = '0.7.144'
 
 [workspace]
 
