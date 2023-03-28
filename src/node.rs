@@ -329,8 +329,10 @@ struct SubchannelSide {
 
 impl AdnlChannel {
 
-    const ESTABLISHED: u64 = 0x8000000000000000;
-    const SEQNO_RESET: u64 = 0x4000000000000000;
+    const CHANNEL_RESET:  u64 = 0x8000000000000000;
+    const ESTABLISHED:    u64 = 0x4000000000000000;
+    const SEQNO_RESET:    u64 = 0x2000000000000000;
+    const MASK_TIMESTAMP: u64 = 0x0FFFFFFFFFFFFFFF;
 
     fn with_keys(
         local_key: &Arc<KeyId>, 
@@ -995,7 +997,6 @@ impl Display for IpAddress {
 declare_counted!(
     struct Peer {
         address: AdnlNodeAddress,
-        last_packets: AtomicU32,
         recv_state: PeerState,
         send_state: PeerState
     }
@@ -2089,7 +2090,6 @@ impl AdnlNode {
 
     const CLOCK_TOLERANCE_SEC: i32 = 60; 
     const MAX_ADNL_MESSAGE: usize = 1024;
-//    const MAX_NO_FEEDBACK: u32 = 200;
     const MAX_PRIORITY_ATTEMPTS: u64 = 10;
     const SIZE_BUFFER: usize = 2048;
     const TIMEOUT_ADDRESS_SEC: i32 = 1000;       
@@ -2712,7 +2712,6 @@ impl AdnlNode {
                         let peers = AdnlPeers::with_keys(local_key.clone(), ret.clone());
                         let peer = Peer {
                             address,
-                            last_packets: AtomicU32::new(0),
                             recv_state: PeerState::for_receive_with_reinit_date(
                                 self.start_time,
                                 #[cfg(feature = "telemetry")]
@@ -2897,12 +2896,12 @@ impl AdnlNode {
 
         let priority_context = self.clone().send_query_with_priority(
             prefix, query, peers, timeout, true
-        ).await?;
+        )?;
         
         if let MessageRepeat::Required = priority_context.repeat {
             let ordinary_context = self.clone().send_query_with_priority(
                 prefix, query, peers, timeout, false
-            ).await;
+            );
             match ordinary_context {
                 Err(e) => {
                     log::warn!(
@@ -3019,7 +3018,6 @@ impl AdnlNode {
                 |removed| {
                     let peer = Peer {
                         address,
-                        last_packets: AtomicU32::new(0),
                         recv_state: PeerState::for_receive_with_reinit_date(
                             peer.recv_state.reinit_date.load(atomic::Ordering::Relaxed) + 1,
                             #[cfg(feature = "telemetry")]
@@ -3049,7 +3047,7 @@ impl AdnlNode {
     /// Send custom message
     pub fn send_custom(
         &self, 
-        data: &TaggedByteSlice, 
+        data: &TaggedByteSlice<'_>, 
         peers: &AdnlPeers,
     ) -> Result<()> {
         let msg = TaggedAdnlMessage {
@@ -3216,8 +3214,13 @@ impl AdnlNode {
         }
         if let Some(reinit_date) = reinit_date {
             if let Some(addr_reinit_date) = &address_reinit_date {
-                if addr_reinit_date != reinit_date {
-                    fail!("Address and source reinit dates mismatch")
+                if addr_reinit_date > reinit_date {
+                    fail!(
+                        "Address and source reinit dates mismatch on {}: {} vs {}", 
+                        local_key,
+                        addr_reinit_date, 
+                        reinit_date
+                    )
                 }
                 address_reinit_date = None
             }
@@ -3720,18 +3723,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
                 } else {
                     /* Monitor channel health using queries */
                     if let Some(channel) = &context.channel {
-                        let flags = AdnlChannel::ESTABLISHED | AdnlChannel::SEQNO_RESET;
-                        let now = Version::get() as u64;
-                        let was = channel.flags.compare_exchange(
-                            flags,
-                            flags | (now + Self::TIMEOUT_CHANNEL_RESET_SEC),
-                            atomic::Ordering::Relaxed,
-                            atomic::Ordering::Relaxed
-                        ).unwrap_or_else(|was| was);
-                        let was = was & !AdnlChannel::ESTABLISHED;
-                        if (was > 0) && (was < now as u64) {
-                            self.reset_peers(&peers)? 
-                        }
+                        self.try_reset_peers(channel, peers)?;
                     }
                     return Ok(None)
                 },
@@ -3826,10 +3818,9 @@ println!("RECV {}", received_len);
             }
         }
         let peers = Arc::new(AdnlPeers::with_keys(local_key, other_key));
+        #[cfg(feature = "telemetry")]
         if let Some(peer) = self.peers(peers.local())?.map_of.get(peers.other()) {
-            #[cfg(feature = "telemetry")]
             peer.val().update_recv_stats(received_len as u64, peers.local());
-            peer.val().last_packets.store(0, atomic::Ordering::Relaxed);
         }
         if let Some(msg) = pkt.message { 
             #[cfg(feature = "telemetry")]
@@ -3876,7 +3867,7 @@ println!("RECV {}", received_len);
         Ok(())
     }
 
-    async fn send_query_with_priority(
+    fn send_query_with_priority(
         self: Arc<Self>, 
         prefix: Option<&[u8]>,
         query: &TaggedTlObject,
@@ -3948,20 +3939,20 @@ println!("RECV {}", received_len);
         let src = adnl_peers.local();
         let dst = adnl_peers.other();
         let peers = self.peers(src)?;
-        let peer = peers.map_of.get(dst).ok_or_else(|| error! ("Unknown peer {}", dst))?;
-/*
         let mut peer = peers.map_of.get(dst).ok_or_else(|| error! ("Unknown peer {}", dst))?;
-        if peer.val().last_packets.load(atomic::Ordering::Relaxed) > Self::MAX_NO_FEEDBACK {
-            // Reset channel when using messages only and no feedack from peer
-            log::warn!(target: TARGET, "Reset channel {} -> {} due to absent feedback", src, dst);
-            self.reset_peers(adnl_peers)?;
-            peer = peers.map_of.get(dst).ok_or_else(|| error! ("Unknown peer {}", dst))?;
-        }
-*/
+        let mut channel = peers.channels_send.get(dst).map(|guard| guard.val().clone());
+
+        if let Some(ch) = &channel {
+            if let AdnlMessage::Adnl_Message_Custom(_) = &msg.object {
+                if self.try_reset_peers(ch, adnl_peers)? {
+                    peer = peers.map_of.get(dst).ok_or_else(|| error! ("Unknown peer {}", dst))?;
+                    channel = None;
+                } 
+            }
+        } 
 
         let peer = peer.val();
         let src = self.key_by_id(src)?;
-        let channel = peers.channels_send.get(dst).map(|guard| guard.val().clone());
         let create_channel_msg = if channel.is_none() && peers.channels_wait.get(dst).is_none() {
             log::debug!(target: TARGET, "Create channel {} -> {}", src.id(), dst);
             let pub_key = peer.address.channel_key.pub_key()?;
@@ -4223,8 +4214,47 @@ println!("RECV {}", received_len);
         } else {
             self.send_pipeline.put_ordinary(SendJob::Data(job))
         }
-        peer.last_packets.fetch_add(1, atomic::Ordering::Relaxed);
         Ok(repeat)
+
+    }
+
+    fn try_reset_peers(
+        &self, 
+        channel: &Arc<AdnlChannel>, 
+        peers: &AdnlPeers
+    ) -> Result<bool> {
+
+        let flags = channel.flags.load(atomic::Ordering::Relaxed);
+        let flags = flags & (AdnlChannel::ESTABLISHED | AdnlChannel::SEQNO_RESET);
+        let now = Version::get() as u64;
+
+        // Schedule reset if not yet
+        let was = channel.flags.compare_exchange(
+            flags,
+            flags | (now + Self::TIMEOUT_CHANNEL_RESET_SEC),
+            atomic::Ordering::Relaxed,
+            atomic::Ordering::Relaxed
+        ).unwrap_or_else(|was| was);
+
+        // Reset if timeout is over
+        let ts = was & AdnlChannel::MASK_TIMESTAMP;
+        if (ts > 0) && (ts < now) {
+            if channel.flags.compare_exchange(
+                flags | ts,
+                flags | ts | AdnlChannel::CHANNEL_RESET,
+                atomic::Ordering::Relaxed,
+                atomic::Ordering::Relaxed
+            ).is_ok() {            
+                log::warn!(
+                    target: TARGET, 
+                    "Reset channel {} -> {} due to absent feedback",
+                    peers.local(), peers.other()
+                );
+                self.reset_peers(&peers)?;
+                return Ok(true)
+            }
+        }
+        Ok(false)
 
     }
 
