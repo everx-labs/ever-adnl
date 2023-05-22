@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## Version 0.7.166
+
+- Get rid of workspace
+- Increase package version
+
 ## Version: 0.7.144
 
 ### New
@@ -12,4 +17,4 @@ All notable changes to this project will be documented in this file.
 
 ### New
 
-- Bump zstd version up (0.11) 
+- Bump zstd version up (0.11)
