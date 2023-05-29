@@ -935,6 +935,10 @@ impl <T> Wait<T> {
         self.count.fetch_add(1, Ordering::Relaxed)
     }
 
+    pub fn request_immediate(&self) -> usize {
+        self.count.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
     pub fn respond(&self, val: Option<T>) {
         match self.queue_sender.send(val) {
             Ok(()) => (),
