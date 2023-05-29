@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## Version 0.7.180
+
+- Add adjusted interface to Wait
+- Increase package version
+
 ## Version 0.7.166
 
 - Get rid of workspace
