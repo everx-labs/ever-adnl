@@ -431,7 +431,6 @@ impl AdnlChannel {
             Ok(())
         }
 
-
         if buf.len() < 64 {
             fail!("Channel message is too short: {}", buf.len())
         }
