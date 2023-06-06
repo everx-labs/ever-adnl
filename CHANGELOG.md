@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## Version 0.8.1
+
+- Introduce ADNL connection status
+
+## Version 0.8.0
+
+- Push peer to refresh after channel reset
+
 ## Version 0.7.180
 
 - Add adjusted interface to Wait
