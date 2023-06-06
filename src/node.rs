@@ -505,6 +505,10 @@ impl AdnlChannel {
         Self::encrypt(buf, &self.send.priority, version)
     }
 
+    fn get_reset_at(&self) -> u64 {
+        self.flags.load(atomic::Ordering::Relaxed) & Self::MASK_TIMESTAMP
+    }
+
     fn ordinary_recv_id(&self) -> &ChannelId {
         &self.recv.ordinary.id
     }
@@ -2041,6 +2045,27 @@ struct AdnlAlloc {
     transfers: Arc<AtomicU64>
 }
 
+/// ADNL status for operation
+pub struct AdnlStatus {
+    pub priority: bool,          // Operation priority             
+    pub reset_at: Option<u64>    // Channel reset if there is a channel
+}
+
+impl AdnlStatus {
+    fn with_params(priority: bool, channel: &Option<Arc<AdnlChannel>>) -> Self {
+        Self {
+            priority,
+            reset_at: channel.as_ref().map(|ch| ch.get_reset_at())
+        }
+    }
+}
+
+/// ADNL reply with status
+pub struct AdnlReplyWithStatus {
+    pub reply: Option<TLObject>,
+    pub status: AdnlStatus   
+}
+
 /// ADNL node
 pub struct AdnlNode {
     channels_incinerator: lockfree::map::SharedIncin<Arc<KeyId>, Arc<AdnlChannel>>,
@@ -2075,6 +2100,9 @@ impl AdnlNode {
     pub const OPTION_FORCE_COMPRESSION: u32 = 0x0001; // Force traffic compression
     pub const OPTION_FORCE_VERSIONING:  u32 = 0x0002; // Force ADNL versioning
 
+    /// ADNL timeouts
+    pub const TIMEOUT_CHANNEL_RESET_SEC: u64 = 30;   
+
     /// ADNL versions
     const VERSION_INITIAL: u16 = 0x0000;
 
@@ -2092,7 +2120,6 @@ impl AdnlNode {
     const MAX_PRIORITY_ATTEMPTS: u64 = 10;
     const SIZE_BUFFER: usize = 2048;
     const TIMEOUT_ADDRESS_SEC: i32 = 1000;       
-    const TIMEOUT_CHANNEL_RESET_SEC: u64 = 30;   
     const TIMEOUT_QUERY_MIN_MS: u64 = 500;   
     const TIMEOUT_QUERY_MAX_MS: u64 = 5000; 
     const TIMEOUT_QUERY_STOP_MS: u64 = 1; 
@@ -2556,7 +2583,8 @@ impl AdnlNode {
                             let answer = match Self::process_query(
                                 &subscribers_local, 
                                 &query,
-                                &peers_local
+                                &peers_local,
+                                false
                             ).await {
                                 Ok(Some(answer)) => answer,
                                 Err(e) => {
@@ -2859,7 +2887,17 @@ impl AdnlNode {
         peers: &AdnlPeers,
         timeout: Option<u64>
     ) -> Result<Option<TLObject>> {
-        self.query_with_prefix(None, query, peers, timeout).await
+        Ok(self.query_with_prefix_get_status(None, query, peers, timeout).await?.reply)
+    }
+
+    /// Send query and get connection status
+    pub async fn query_get_status(
+        self: Arc<AdnlNode>, 
+        query: &TaggedTlObject,
+        peers: &AdnlPeers,
+        timeout: Option<u64>
+    ) -> Result<AdnlReplyWithStatus> {
+        self.query_with_prefix_get_status(None, query, peers, timeout).await
     }
 
     /// Send query with prefix
@@ -2870,125 +2908,150 @@ impl AdnlNode {
         peers: &AdnlPeers,
         timeout: Option<u64>
     ) -> Result<Option<TLObject>> {
+        Ok(self.query_with_prefix_get_status(prefix, query, peers, timeout).await?.reply)
+    }
 
-        fn get_query_print_id(context: &QuerySendContext, priority: bool) -> String { 
-            format!(
-                "{} query {:02x}{:02x}{:02x}{:02x}",
-                if priority {
-                    "priority"
-                } else {
-                    "ordinary"
-                },
-                context.query_id[0], context.query_id[1], 
-                context.query_id[2], context.query_id[3]
-            )
-        }
- 
+    /// Send query with prefix and get connection status
+    pub async fn query_with_prefix_get_status(
+        self: Arc<AdnlNode>,  
+        prefix: Option<&[u8]>,
+        query: &TaggedTlObject,
+        peers: &AdnlPeers,
+        timeout: Option<u64>
+    ) -> Result<AdnlReplyWithStatus> {
+
         async fn wait_query(
             node: Arc<AdnlNode>, 
             context: Arc<QuerySendContext>,
-            peers: &AdnlPeers
-        ) -> Result<Option<TLObject>> { 
+            peers: &AdnlPeers,
+            priority: bool
+        ) -> Result<AdnlReplyWithStatus> { 
             context.reply_ping.wait().await;
-            node.process_query_result(context, peers)
+            node.process_query_result(context, peers, priority)
         }
 
-        let priority_context = self.clone().send_query_with_priority(
+        async fn get_reply(
+            reader: &mut tokio::sync::mpsc::UnboundedReceiver<(Result<AdnlReplyWithStatus>, bool)>,
+            ctx_priority: &Arc<QuerySendContext>,
+            ctx_ordinary: &Arc<QuerySendContext>,
+            peers: &AdnlPeers,
+            query: &TaggedTlObject
+        ) -> Result<AdnlReplyWithStatus> {
+            if let Some((reply_with_status, priority)) = reader.recv().await {
+                let ctx = if priority {
+                    ctx_priority
+                } else {
+                    ctx_ordinary
+                };
+                match reply_with_status {
+                    Err(e) => {
+                        log::warn!(
+                            target: TARGET, 
+                            "Context setup phase, error with reply to {}: {}", 
+                            AdnlNode::get_query_print_id(&ctx.query_id, peers.other(), priority),
+                            e
+                        );
+                        let ret = AdnlReplyWithStatus {
+                            reply: None,
+                            status: AdnlStatus {
+                                priority,
+                                reset_at: None
+                            }
+                        };
+                        Ok(ret)
+                    },
+                    Ok(reply_with_status) => {
+                        if reply_with_status.reply.is_none() {
+                            log::info!(
+                                target: TARGET, 
+                                "Context setup phase, no reply to {}", 
+                                AdnlNode::get_query_print_id(
+                                    &ctx.query_id, peers.other(), priority
+                                )
+                            )
+                        }
+                        Ok(reply_with_status)
+                    }
+                }
+            } else {
+                reader.close();
+                fail!("INTERNAL ERROR: reply to query {:?} read mismatch", query.object)
+            }
+        }
+         
+        // Send in default context first
+        let ctx_priority = self.clone().send_query_with_priority(
             prefix, query, peers, timeout, true
         )?;
         
-        if let MessageRepeat::Required = priority_context.repeat {
-            let ordinary_context = self.clone().send_query_with_priority(
-                prefix, query, peers, timeout, false
-            );
-            match ordinary_context {
-                Err(e) => {
-                    log::warn!(
-                        target: TARGET, 
-                        "Error when send query in ordinary subchannel: {}", 
-                        e
-                    ); 
-                    wait_query(self, priority_context, peers).await
-                },
-                Ok(ordinary_context) => {
-                    let (sender, mut reader) = tokio::sync::mpsc::unbounded_channel();
-                    let sender = Arc::new(sender);
-                    let cloned_peers = peers.clone();
-                    let cloned_sender = sender.clone();
-                    let context = priority_context.clone();
-                    let node = self.clone();
-                    tokio::spawn(
-                        async move {
-                            cloned_sender.send(
-                                (wait_query(node, context, &cloned_peers).await, true)
-                            )
-                        }
-                    );
-                    let cloned_peers = peers.clone();
-                    let cloned_sender = sender.clone();
-                    let context = ordinary_context.clone();
-                    let node = self.clone();
-                    tokio::spawn(
-                        async move {
-                            cloned_sender.send(
-                                (wait_query(node, context, &cloned_peers).await, false)
-                            )
-                        }
-                    );
-                    let reply = if let Some((reply, priority)) = reader.recv().await {
-                        let context = if priority {
-                            priority_context
-                        } else {
-                            ordinary_context
-                        };
-                        match &reply {
-                            Err(e) => {
-                                let id = get_query_print_id(&context, priority);
-                                log::warn!(target: TARGET, "Error with {} reply: {}", id, e);
-                                None
-                            },
-                            Ok(None) => {
-                                let id = get_query_print_id(&context, priority);
-                                log::info!(target: TARGET, "No reply to {}", id);
-                                None
-                            },
-                            Ok(Some(_)) => Some(reply)
-                        }
-                    } else {
-                        reader.close();
-                        fail!(
-                            "INTERNAL ERROR: 1st query reply to {:?} read mismatch", 
-                            query.object
-                        );
-                    };
-                    if let Some(reply) = reply {
-                        tokio::spawn(
-                            async move {
-                                if reader.recv().await.is_some() {
-                                    Self::graceful_close(reader).await
-                                } else {
-                                    log::warn!(
-                                        target: TARGET, 
-                                        "INTERNAL ERROR: query reply flush mismatch"
+        // Send in backup context if required
+        match ctx_priority.repeat {
+            MessageRepeat::Required => {
+                let ctx_ordinary = self.clone().send_query_with_priority(
+                    prefix, query, peers, timeout, false
+                );
+                match ctx_ordinary {
+                    Err(e) => {
+                        log::warn!(
+                            target: TARGET, 
+                            "Error when send query in ordinary subchannel: {}",
+                            e
+                        ); 
+                        wait_query(self, ctx_priority, peers, true).await
+                    },
+                    Ok(ctx_ordinary) => {
+                        // Wait for operations result
+                        let (sender, mut reader) = tokio::sync::mpsc::unbounded_channel();
+                        let sender = Arc::new(sender);
+                        for p in [true, false] {
+                            let cloned_peers = peers.clone();
+                            let cloned_sender = sender.clone();
+                            let ctx = if p {
+                                ctx_priority.clone()
+                            } else {
+                                ctx_ordinary.clone()
+                            };
+                            let node = self.clone();
+                            tokio::spawn(
+                                async move {
+                                    cloned_sender.send(
+                                        (wait_query(node, ctx, &cloned_peers, p).await, p)
                                     )
                                 }
-                            }
-                        );
-                        reply
-                    } else if let Some((reply, _)) = reader.recv().await {
-                        Self::graceful_close(reader).await;
-                        reply
-                    } else {
-                        reader.close();
-                        fail!(
-                            "INTERNAL ERROR: 2nd query reply to {:?} read mismatch", 
-                            query.object
-                        );
+                            );
+                        }
+                        let reply_with_status = get_reply(
+                            &mut reader, &ctx_priority, &ctx_ordinary, peers, query
+                        ).await?;
+                        // We occasionally can receive both replies, and ordinary the first,
+                        // But return first to avoid timeout. 
+                        // There is a tolerance based on several priority attempts.
+                        if reply_with_status.reply.is_some() {
+                            tokio::spawn(
+                                async move {
+                                    if reader.recv().await.is_some() {
+                                        Self::graceful_close(reader).await
+                                    } else {
+                                        log::warn!(
+                                            target: TARGET, 
+                                            "INTERNAL ERROR: query reply flush mismatch"
+                                        )
+                                    }
+                                }
+                            );
+                            Ok(reply_with_status)
+                        } else {
+                            get_reply(
+                                &mut reader, &ctx_priority, &ctx_ordinary, peers, query
+                            ).await
+                        }
                     }
                 }
-            }
-        } else {
-            wait_query(self, priority_context, peers).await
+            },
+            MessageRepeat::NotNeeded => 
+                wait_query(self, ctx_priority, peers, true).await,
+            MessageRepeat::Unapplicable => 
+                wait_query(self, ctx_priority, peers, false).await
         }
 
     }
@@ -3040,7 +3103,7 @@ impl AdnlNode {
                     self.drop_receive_subchannels(removed.val())
                 }
              );
-        Ok(())
+        self.push_peer_to_refresh(to_reset)
     }
 
     /// Send custom message
@@ -3049,6 +3112,16 @@ impl AdnlNode {
         data: &TaggedByteSlice<'_>, 
         peers: &AdnlPeers,
     ) -> Result<()> {
+        self.send_custom_get_status(data, peers)?;
+        Ok(())
+    }
+
+    /// Send custom message and get connection status
+    pub fn send_custom_get_status(
+        &self, 
+        data: &TaggedByteSlice<'_>, 
+        peers: &AdnlPeers,
+    ) -> Result<AdnlStatus> {
         let msg = TaggedAdnlMessage {
             object: AdnlCustomMessage {
                 data: ton::bytes(data.object.to_vec())
@@ -3056,9 +3129,9 @@ impl AdnlNode {
             #[cfg(feature = "telemetry")]
             tag: data.tag
         };
-        let (_, repeat) = self.send_message_to_peer(msg, peers, false)?;
+        let (channel, repeat) = self.send_message_to_peer(msg, peers, false)?;
         match repeat {
-            MessageRepeat::Unapplicable => Ok(()), 
+            MessageRepeat::Unapplicable => Ok(AdnlStatus::with_params(false, &channel)),
             x => fail!("INTERNAL ERROR: bad repeat {:?} in ADNL custom message", x)
         }
     }
@@ -3277,14 +3350,8 @@ impl AdnlNode {
             if *dst_reinit_date != 0 {
                 if let Ordering::Less = cmp_dst {
                     // Push peer to refresh reinit date
-                    self.send_message_to_peer(
-                        TaggedAdnlMessage {
-                            object: AdnlMessage::Adnl_Message_Nop,
-                            #[cfg(feature = "telemetry")]
-                            tag: 0x80000000 // Service message, tag is not important
-                        },
-                        &AdnlPeers::with_keys(local_key.clone(), ret.clone()),
-                        false,
+                    self.push_peer_to_refresh(
+                        &AdnlPeers::with_keys(local_key.clone(), ret.clone())
                     )?;
                     fail!(
                         "Destination reinit date is too old: {} vs {}, {:?}", 
@@ -3434,7 +3501,7 @@ impl AdnlNode {
     }
 
     fn decrypt_packet_from_channel(
-        &self, 
+        &self,                                                                                                                               
         buf: &mut Vec<u8>,
         channel: &Arc<AdnlChannel>,
         priority: bool
@@ -3455,10 +3522,17 @@ impl AdnlNode {
             }
         }
         // Restore channel health 
-        channel.flags.store(
+        let was = channel.flags.swap(
             AdnlChannel::ESTABLISHED | AdnlChannel::SEQNO_RESET, 
             atomic::Ordering::Relaxed
         );
+        if (was & AdnlChannel::MASK_TIMESTAMP) != 0 {
+            log::info!(
+                target: TARGET, 
+                "Reset channel {} -> {} cancelled",
+                channel.local_key, channel.other_key
+            );
+        }
         Ok(version)
     }
 
@@ -3469,13 +3543,26 @@ impl AdnlNode {
         self.channels_recv.remove(channel.ordinary_recv_id());
         self.channels_recv.remove(channel.priority_recv_id())
     }
-
+   
     fn gen_rand() -> Vec<u8> {  
         const RAND_SIZE: usize = 16;
         let mut ret = Vec::with_capacity(RAND_SIZE);
         ret.resize(RAND_SIZE, 0);
         rand::thread_rng().fill(&mut ret[..]);
         ret
+    }
+
+    fn get_query_print_id(query_id: &QueryId, peer: &Arc<KeyId>, priority: bool) -> String {
+        format!(
+            "{} query {:02x}{:02x}{:02x}{:02x} @ {}",
+            if priority {
+                "priority"
+            } else {
+                "ordinary"
+            },
+            query_id[0], query_id[1], query_id[2], query_id[3],
+            peer
+        )
     }
 
     async fn graceful_close<T>(mut reader: tokio::sync::mpsc::UnboundedReceiver<T>) {
@@ -3651,7 +3738,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
             },
             AdnlMessage::Adnl_Message_Nop => None,
             AdnlMessage::Adnl_Message_Query(query) => {
-                Self::process_query(subscribers, &query, peers).await?
+                Self::process_query(subscribers, &query, peers, priority).await?
             },
             _ => fail!("Unsupported ADNL message {:?}", msg)
         };
@@ -3683,60 +3770,71 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
     async fn process_query(
         subscribers: &[Arc<dyn Subscriber>],
         query: &AdnlQueryMessage,
-        peers: &AdnlPeers
+        peers: &AdnlPeers,
+        priority: bool
     ) -> Result<Option<TaggedAdnlMessage>> {
         let query_id = query.query_id.as_slice();
         log::info!(
             target: TARGET_QUERY, 
-            "Recv query {:02x}{:02x}{:02x}{:02x}", 
-            query_id[0], query_id[1], query_id[2], query_id[3]
+            "Recv {}", 
+            Self::get_query_print_id(&query_id, peers.other(), priority)
         );
         if let (true, answer) = Query::process_adnl(subscribers, query, peers).await? {
             log::info!(
                 target: TARGET_QUERY, 
-                "Reply to query {:02x}{:02x}{:02x}{:02x}", 
-                query_id[0], query_id[1], query_id[2], query_id[3]
+                "Reply to {}", 
+                Self::get_query_print_id(&query_id, peers.other(), priority)
             );
             Ok(answer)
         } else {
             fail!("No subscribers for query {:?}", query)
         }
-    }
+    }                                                             
 
     fn process_query_result(
         &self, 
         context: Arc<QuerySendContext>, 
-        peers: &AdnlPeers
-    ) -> Result<Option<TLObject>> {
+        peers: &AdnlPeers,
+        priority: bool
+    ) -> Result<AdnlReplyWithStatus> {
         log::info!(
             target: TARGET_QUERY, 
-            "Finished query {:02x}{:02x}{:02x}{:02x}", 
-            context.query_id[0], context.query_id[1], context.query_id[2], context.query_id[3]
+            "Finished {}",
+            Self::get_query_print_id(&context.query_id, peers.other(), priority) 
         );
         if let Some(removed) = self.queries.remove(&context.query_id) {
-            match removed.val() {
+            let reply = match removed.val() {
                 Query::Received(answer) => 
-                    return Ok(Some(deserialize_boxed(answer)?)),
+                    Some(deserialize_boxed(answer)?),
                 Query::Timeout => if let MessageRepeat::Required = context.repeat {
-                    return Ok(None)
+                    None
                 } else {
                     /* Monitor channel health using queries */
                     if let Some(channel) = &context.channel {
                         self.try_reset_peers(channel, peers)?;
                     }
-                    return Ok(None)
+                    None
                 },
-                _ => ()
-            }
-        }
-        fail!(
-            "INTERNAL ERROR: ADNL query {:02x}{:02x}{:02x}{:02x} mismatch",
-            context.query_id[0], context.query_id[1], context.query_id[2], context.query_id[3]
-        )
+                Query::Sent(_) => fail!(
+                    "INTERNAL ERROR: ADNL {} Query::Sent state on receive detected", 
+                    Self::get_query_print_id(&context.query_id, peers.other(), priority)
+                )
+            };
+            let ret = AdnlReplyWithStatus {
+                reply,
+                status: AdnlStatus::with_params(priority, &context.channel)
+            };
+            Ok(ret)
+        } else {
+            fail!(
+                "INTERNAL ERROR: ADNL {} mismatch: unregistered query detected", 
+                Self::get_query_print_id(&context.query_id, peers.other(), priority)
+            )
+        } 
     }
 
     async fn process_packet(
-        &self, 
+        &self,                                                     
         packet: &mut PacketBuffer,
         subchannel: Subchannel,
         subscribers: &[Arc<dyn Subscriber>],
@@ -3866,38 +3964,17 @@ println!("RECV {}", received_len);
         Ok(())
     }
 
-    fn send_query_with_priority(
-        self: Arc<Self>, 
-        prefix: Option<&[u8]>,
-        query: &TaggedTlObject,
-        peers: &AdnlPeers,
-        timeout: Option<u64>,
-        priority: bool
-    ) -> Result<Arc<QuerySendContext>> {
-        let (query_id, msg) = Query::build(prefix, &query)?;
-        let (ping, query) = Query::new();
-        self.queries.insert(query_id, query);
-        log::info!(
-            target: TARGET_QUERY, 
-            "Send query {:02x}{:02x}{:02x}{:02x}", 
-            query_id[0], query_id[1], query_id[2], query_id[3]
-        );
-        let (channel, repeat) = if peers.local() == peers.other() {       
-            self.queue_send_loopback_packets.send((msg.object, peers.local().clone()))?;
-            (None, MessageRepeat::Unapplicable)
-        } else {
-            self.send_message_to_peer(msg, &peers, priority)?
-        };
-        self.queue_monitor_queries.push(
-            (timeout.unwrap_or(Self::TIMEOUT_QUERY_MAX_MS), query_id)
-        );
-        let ret = QuerySendContext {
-            channel, 
-            query_id,
-            repeat,
-            reply_ping: ping
-        };
-        Ok(Arc::new(ret))
+    fn push_peer_to_refresh(&self, peers: &AdnlPeers) -> Result<()> {
+        self.send_message_to_peer(
+            TaggedAdnlMessage {
+                object: AdnlMessage::Adnl_Message_Nop,
+                #[cfg(feature = "telemetry")]
+                tag: 0x80000000 // Service message, tag is not important
+            },
+            peers,
+            false
+        )?;
+        Ok(())
     }
 
     fn send_message_to_peer(
@@ -4217,6 +4294,40 @@ println!("RECV {}", received_len);
 
     }
 
+    fn send_query_with_priority(
+        self: Arc<Self>, 
+        prefix: Option<&[u8]>,
+        query: &TaggedTlObject,
+        peers: &AdnlPeers,
+        timeout: Option<u64>,
+        priority: bool
+    ) -> Result<Arc<QuerySendContext>> {
+        let (query_id, msg) = Query::build(prefix, &query)?;
+        let (ping, query) = Query::new();
+        self.queries.insert(query_id, query);
+        log::info!(
+            target: TARGET_QUERY, 
+            "Send {}", 
+            Self::get_query_print_id(&query_id, peers.other(), priority)
+        );
+        let (channel, repeat) = if peers.local() == peers.other() {       
+            self.queue_send_loopback_packets.send((msg.object, peers.local().clone()))?;
+            (None, MessageRepeat::Unapplicable)
+        } else {
+            self.send_message_to_peer(msg, &peers, priority)?
+        };
+        self.queue_monitor_queries.push(
+            (timeout.unwrap_or(Self::TIMEOUT_QUERY_MAX_MS), query_id)
+        );
+        let ret = QuerySendContext {
+            channel, 
+            query_id,
+            repeat,
+            reply_ping: ping
+        };
+        Ok(Arc::new(ret))
+    }
+
     fn try_reset_peers(
         &self, 
         channel: &Arc<AdnlChannel>, 
@@ -4252,6 +4363,13 @@ println!("RECV {}", received_len);
                 self.reset_peers(&peers)?;
                 return Ok(true)
             }
+        } else if ts == 0 {
+            log::warn!(
+                target: TARGET, 
+                "Reset channel {} -> {} scheduled after {} seconds",
+                peers.local(), peers.other(),
+                Self::TIMEOUT_CHANNEL_RESET_SEC
+            );
         }
         Ok(false)
 
