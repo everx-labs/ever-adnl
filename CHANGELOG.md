@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## Version 0.8.15
+
+- Do not use base64, crypto crates directly
+
 ## Version 0.8.1
 
 - Introduce ADNL connection status

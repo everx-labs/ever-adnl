@@ -1,5 +1,5 @@
 /*
-* Copyright (C) 2019-2021 TON Labs. All Rights Reserved.
+* Copyright (C) 2019-2023 EverX. All Rights Reserved.
 *
 * Licensed under the SOFTWARE EVALUATION License (the "License"); you may not use
 * this file except in compliance with the License.
@@ -18,12 +18,13 @@ use crate::{
         Query, Subscriber, TARGET, Timeouts
     }
 };
-use ever_crypto::{Ed25519KeyOption, KeyId, KeyOption, KeyOptionJson};
 use std::{convert::TryInto, net::SocketAddr, sync::Arc, time::Duration};
 use stream_cancel::StreamExt;
 use futures::prelude::*;
 use ton_api::{deserialize_boxed, serialize_boxed_inplace, {ton::adnl::Message as AdnlMessage}};
-use ton_types::{error, fail, Result};
+use ton_types::{
+    error, fail, base64_encode, Ed25519KeyOption, KeyId, KeyOption, KeyOptionJson, Result
+};
 
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -48,10 +49,10 @@ impl AdnlServerConfigJson {
         timeouts: Option<Timeouts>
     )-> Self {
         AdnlServerConfigJson {
-            address: address,
+            address,
             clients: AdnlServerClients::List(client_keys),
-            server_key: server_key,
-            timeouts: timeouts
+            server_key,
+            timeouts
         }
     }
 }
@@ -85,7 +86,7 @@ impl AdnlServerConfig {
                     let key = Ed25519KeyOption::from_public_key_json(key)?;
                     let key = key.pub_key()?;
                     if clients.insert(key.try_into()?, 0).is_some() {
-                        fail!("Duplicated client key {} in server config", base64::encode(key))
+                        fail!("Duplicated client key {} in server config", base64_encode(key))
                     }
                 }
                 Some(clients)
@@ -149,7 +150,7 @@ impl AdnlServerThread {
                 fail!("ADNL init message is too short ({})", buf.len())
             }
             if !clients.iter().any(|client| &buf[32..64] == client.key()) {
-                fail!("Message from unknown client {}", base64::encode(&buf[32..64]))
+                fail!("Message from unknown client {}", base64_encode(&buf[32..64]))
             }
         }
         let (mut crypto, peers) = Self::parse_init_packet(&key, &mut buf)?;
@@ -162,7 +163,7 @@ impl AdnlServerThread {
                 .map_err(|msg| error!("Unsupported ADNL message {:?}", msg))?;
             let (consumed, reply) = match &msg {
                 AdnlMessage::Adnl_Message_Query(query) => 
-                    Query::process_adnl(&subscribers, &query, &peers).await?,
+                    Query::process_adnl(&subscribers, query, &peers).await?,
                 _ => (false, None)
             };
             if consumed {
