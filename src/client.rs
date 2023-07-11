@@ -1,5 +1,5 @@
 /*
-* Copyright (C) 2019-2021 TON Labs. All Rights Reserved.
+* Copyright (C) 2019-2023 EverX. All Rights Reserved.
 *
 * Licensed under the SOFTWARE EVALUATION License (the "License"); you may not use
 * this file except in compliance with the License.
@@ -14,10 +14,9 @@
 use crate::common::{
     AdnlHandshake, AdnlStream, AdnlStreamCrypto, Query, TaggedTlObject, Timeouts
 };
-use ever_crypto::{Ed25519KeyOption, KeyOption, KeyOptionJson};
 use rand::Rng;
 use std::{convert::TryInto, net::SocketAddr, sync::Arc, time::{Duration, SystemTime}};
-use ton_api::{deserialize_boxed, serialize_boxed,
+use ton_api::{deserialize_boxed, deserialize_typed, serialize_boxed,
     ton::{
         TLObject, adnl::{Message as AdnlMessage, Pong as AdnlPongBoxed},
         rpc::adnl::Ping as AdnlPing
@@ -25,7 +24,7 @@ use ton_api::{deserialize_boxed, serialize_boxed,
 };
 #[cfg(feature = "telemetry")]
 use ton_api::{BoxedSerialize, ConstructorNumber};
-use ton_types::{error, fail, Result};
+use ton_types::{fail, Ed25519KeyOption, KeyOption, KeyOptionJson, Result};
 
 #[derive(serde::Deserialize, serde::Serialize)]
 pub struct AdnlClientConfigJson {
@@ -40,8 +39,8 @@ impl AdnlClientConfigJson {
         AdnlClientConfigJson {
             client_key: None,
             server_address: server.to_string(),
-            server_key: server_key,
-            timeouts: timeouts
+            server_key,
+            timeouts
         }
     }
 }
@@ -179,17 +178,14 @@ impl AdnlClient {
                 break;
             }
         }
-        let answer = deserialize_boxed(&buf[..])?
-            .downcast::<AdnlMessage>()
-            .map_err(|answer| error!("Unsupported ADNL message {:?}", answer))?;
-        match answer {
+        match deserialize_typed(buf)? {
             AdnlMessage::Adnl_Message_Answer(answer) => 
                 if &query_id == answer.query_id.as_slice() {
                     deserialize_boxed(&answer.answer)
                 } else {
                     fail!("Query ID mismatch {:?} vs {:?}", query.object, answer)
                 },
-            _ => fail!("Unexpected answer to query {:?}: {:?}", query.object, answer)
+            answer => fail!("Unexpected answer to query {:?}: {:?}", query.object, answer)
         } 
     }
 

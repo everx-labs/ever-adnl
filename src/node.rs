@@ -1,5 +1,5 @@
 /*
-* Copyright (C) 2019-2021 TON Labs. All Rights Reserved.
+* Copyright (C) 2019-2023 EverX. All Rights Reserved.
 *
 * Licensed under the SOFTWARE EVALUATION License (the "License"); you may not use
 * this file except in compliance with the License.
@@ -27,7 +27,6 @@ use crate::dump;
 use crate::telemetry::{Metric, MetricBuilder, TelemetryItem, TelemetryPrinter};
 
 use aes_ctr::cipher::stream::SyncStreamCipher;
-use ever_crypto::{Ed25519KeyOption, KeyId, KeyOption, KeyOptionJson, sha256_digest};
 use rand::Rng;
 use std::{
     cmp::{max, min, Ordering}, collections::VecDeque, fmt::{self, Debug, Display, Formatter}, 
@@ -41,7 +40,7 @@ use std::{
 #[cfg(feature = "dump")]
 use std::{fs::{create_dir_all, OpenOptions, rename}, io::Write, path::PathBuf};
 use ton_api::{
-    deserialize_boxed, IntoBoxed, serialize_boxed, 
+    deserialize_boxed, deserialize_typed, IntoBoxed, serialize_boxed, 
     ton::{
         self, TLObject,  
         adnl::{
@@ -57,27 +56,13 @@ use ton_api::{
     }
 };
 #[cfg(feature = "telemetry")]
-use ton_api::{tag_from_data};
-use ton_types::{error, fail, Result, UInt256};
+use ton_api::tag_from_data;
+use ton_types::{
+    error, fail, base64_encode, Ed25519KeyOption, KeyId, KeyOption, KeyOptionJson, Result, 
+    sha256_digest, UInt256
+};
 
 const TARGET_QUERY: &str = "adnl_query";
-
-#[macro_export]
-macro_rules! adnl_node_compatibility_key {
-    ($tag: expr, $key: expr) => {
-        format!(
-            "{{
-                \"tag\": {},
-                \"data\": {{         
-                    \"type_id\": 1209251014,
-                    \"pub_key\": \"{}\"
-                }}
-            }}",
-            $tag, 
-            $key
-        ).as_str()
-    }
-}
 
 #[macro_export]
 macro_rules! adnl_node_test_key {
@@ -160,12 +145,8 @@ impl AddressCache {
     pub fn dump(&self) {
         let (mut iter, mut current) = self.first();
         log::debug!(target: TARGET, "ADDRESS CACHE:");
-        loop {
-            if let Some(peer) = current {
-                log::debug!(target: TARGET, "{}", peer)
-            } else {
-                break
-            };
+        while let Some(peer) = current {
+            log::debug!(target: TARGET, "{}", peer);
             current = self.next(&mut iter)
         }
     }
@@ -278,11 +259,7 @@ impl AddressCache {
     }
   
     fn find_by_index(&self, index: u32) -> Option<Arc<KeyId>> {
-        if let Some(address) = self.index.get(&index) {
-            Some(address.val().clone())
-        } else {
-            None
-        }
+        self.index.get(&index).map(|address| address.val().clone())
     }
 
     fn random(&self, skip: Option<&lockfree::set::Set<Arc<KeyId>>>) -> Option<Arc<KeyId>> {
@@ -346,7 +323,7 @@ impl AdnlChannel {
         )?;
         let cmp = local_key.cmp(other_key);
         let (fwd_secret, rev_secret) = if Ordering::Equal == cmp {
-            (fwd_secret, fwd_secret.clone())
+            (fwd_secret, fwd_secret)
         } else {
             let rev_secret = [
                 fwd_secret[31], fwd_secret[30], fwd_secret[29], fwd_secret[28], fwd_secret[27], 
@@ -404,7 +381,7 @@ impl AdnlChannel {
 
     fn calc_id(secret: &[u8; 32]) -> Result<ChannelId> {
         let object = AesKey {
-            key: UInt256::with_array(secret.clone())
+            key: UInt256::with_array(*secret)
         };
         hash(object)
     }
@@ -465,28 +442,8 @@ impl AdnlChannel {
 
     fn encrypt(buf: &mut Vec<u8>, side: &SubchannelSide, version: Option<u16>) -> Result<()> {
         AdnlCryptoUtils::encode_header(buf, &side.id, None, version);
-/*        
-        let checksum = sha256_digest(buf);
-        let len = buf.len();
-        let hdr = if version.is_some() {
-            68
-        } else {
-            64
-        };
-        buf.resize(len + hdr, 0);
-        buf[..].copy_within(..len, hdr);
-        buf[..32].copy_from_slice(&side.id);
-        let idx = if let Some(version) = version {
-            let version = AdnlCryptoUtils::encode_version(version, &side.id, &checksum);
-            buf[32..36].copy_from_slice(&version);
-            36
-        } else {
-            32
-        };
-        buf[idx..hdr].copy_from_slice(&checksum);
-*/
         //dump!(info, TARGET, "secret ->", &side.secret);
-        let ret = Self::process_data(
+        Self::process_data(
             buf, 
             &side.secret, 
             if version.is_some() {
@@ -494,8 +451,7 @@ impl AdnlChannel {
             } else {
                 64
             }
-        );
-        ret
+        )
     }
 
     fn encrypt_ordinary(&self, buf: &mut Vec<u8>, version: Option<u16>) -> Result<()> {
@@ -522,7 +478,7 @@ impl AdnlChannel {
         &self.recv.priority.id
     }
 
-    fn process_data(buf: &mut Vec<u8>, secret: &[u8; 32], offset: usize) -> Result<()> {
+    fn process_data(buf: &mut [u8], secret: &[u8; 32], offset: usize) -> Result<()> {
         if offset < 32 {
             fail!("INTERNAL ERROR: bad offset of data to process")
         }
@@ -545,9 +501,8 @@ struct AdnlNodeAddress {
 impl AdnlNodeAddress {
 
     fn from_ip_address_and_key(ip_address: &IpAddress, key: &Arc<dyn KeyOption>) -> Result<Self> {
-        let channel_key = Ed25519KeyOption::generate()?;
         let ret = Self {
-            channel_key: channel_key,
+            channel_key: Ed25519KeyOption::generate()?,
             ip_address: AtomicU64::new(ip_address.address),
             ip_version: AtomicU32::new(ip_address.version as u32),
             key: key.clone()
@@ -1187,7 +1142,8 @@ impl PeerHistory {
             }
             // Masks format: 
             // lower0, lower1, lower2, lower3, upper0, upper1, upper2, upper3
-            let mask = 1 << seqno_masked % 64;
+            let mask = 1 << (seqno_masked % 64);
+            #[allow(clippy::comparison_chain)]
             let mask_offset = if index_normalized > seqno_normalized {
                 // Lower part of the window
                 Some(0)
@@ -1497,6 +1453,7 @@ impl <T> Queue<T> {
     }
 
     fn get(&self) -> Option<T> {
+        #[allow(clippy::let_and_return)]
         let ret = self.queue.pop();
         #[cfg(feature = "telemetry")] 
         if ret.is_some() {
@@ -1556,7 +1513,6 @@ impl RecvPipeline {
             max_workers
         };
         Self {
-            adnl: adnl.clone(),
 //            count: AtomicU64::new(0),
             max_workers,
             max_ordinary_workers,
@@ -1574,7 +1530,8 @@ impl RecvPipeline {
             subscribers,
             #[cfg(feature = "static_workers")]
             sync: lockfree::queue::Queue::new(),
-            workers: AtomicU64::new(0)
+            workers: AtomicU64::new(0),
+            adnl
         }
     }
                                                                                                                     
@@ -2332,7 +2289,7 @@ impl AdnlNode {
         let recv_pipeline = Arc::new(
             RecvPipeline::with_params(
                 node.clone(), 
-                tokio::runtime::Handle::current().clone(), 
+                tokio::runtime::Handle::current(), 
                 subscribers
             )
         );
@@ -2776,9 +2733,9 @@ impl AdnlNode {
                 target: TARGET, 
                 "Added ADNL peer with IP {}, keyID {}, key {} to {}",
                 peer_ip_address,  
-                base64::encode(peer_key.id().data()),
-                base64::encode(peer_key.pub_key()?),
-                base64::encode(local_key.data())
+                base64_encode(peer_key.id().data()),
+                base64_encode(peer_key.pub_key()?),
+                base64_encode(local_key.data())
             )
         }
         Ok(Some(ret))
@@ -3125,7 +3082,7 @@ impl AdnlNode {
     ) -> Result<AdnlStatus> {
         let msg = TaggedAdnlMessage {
             object: AdnlCustomMessage {
-                data: ton::bytes(data.object.to_vec())
+                data: data.object.to_vec().into()
             }.into_boxed(),
             #[cfg(feature = "telemetry")]
             tag: data.tag
@@ -3157,7 +3114,7 @@ impl AdnlNode {
                     prev = if let Some(found) = found {
                         if found.send.ordinary.id == channel.send.ordinary.id {
                             return Ok(None)
-                        }
+                        }                                     
                         Some(found.clone())
                     } else {
                         None
@@ -3167,11 +3124,9 @@ impl AdnlNode {
             )?;
             if added {
                 prev.or_else(
-                    || if let Some(removed) = peers.channels_send.remove(&channel.other_key) {
-                        Some(removed.val().clone())
-                    } else {
-                        None
-                    }
+                    || peers.channels_send.remove(&channel.other_key).map(
+                        |removed| removed.val().clone()
+                    )
                 ).and_then(
                     |removed| self.drop_receive_subchannels(&removed)
                 );
@@ -3243,7 +3198,7 @@ impl AdnlNode {
             if let Some(signature) = &packet.signature {
                 let mut to_sign = packet.clone();
                 to_sign.signature = None;
-                key.verify(&serialize_boxed(&to_sign.into_boxed())?, &signature)
+                key.verify(&serialize_boxed(&to_sign.into_boxed())?, signature)
             } else if mandatory {
                 fail!("No mandatory signature in ADNL packet")
             } else {
@@ -3257,7 +3212,7 @@ impl AdnlNode {
             }
             (channel.other_key.clone(), None, true)
         } else if let Some(pub_key) = &packet.from {
-            let key = Ed25519KeyOption::from_public_key_tl(pub_key)?;
+            let key: Arc<dyn KeyOption> = pub_key.try_into()?;
             let other_key = key.id().clone();
             if let Some(id) = &packet.from_short {
                 if other_key.data() != id.id.as_slice() {
@@ -3267,7 +3222,7 @@ impl AdnlNode {
             check_signature(packet, &key, true)?;
             if let Some(address) = &packet.address {
                 if let Some(ip_address) = Self::parse_address_list(address)? {
-                    self.add_peer(&local_key, &ip_address, &key)?;
+                    self.add_peer(local_key, &ip_address, &key)?;
                     (other_key, Some(address.reinit_date), false)
                 } else {
                     (other_key, None, false)
@@ -3298,7 +3253,7 @@ impl AdnlNode {
                 address_reinit_date = None
             }
         }
-        let peers = self.peers(&local_key)?;
+        let peers = self.peers(local_key)?;
         let peer = if let Some(channel) = channel {
             peers.map_of.get(&channel.other_key)
         } else {
@@ -3473,8 +3428,8 @@ impl AdnlNode {
                 fail!(
                     "Mismatch in key for channel {}\n{} / {}",
                     context,
-                    base64::encode(local_pub_key), 
-                    base64::encode(other_pub)
+                    base64_encode(local_pub_key), 
+                    base64_encode(other_pub)
                 )
             }
         } else {
@@ -3495,8 +3450,8 @@ impl AdnlNode {
         log::trace!(
             target: TARGET,
             "Channel send ID {}, recv ID {}", 
-            base64::encode(channel.ordinary_send_id()),
-            base64::encode(channel.ordinary_recv_id())
+            base64_encode(channel.ordinary_send_id()),
+            base64_encode(channel.ordinary_recv_id())
         );
         Ok(Arc::new(channel))
     }
@@ -3547,8 +3502,7 @@ impl AdnlNode {
    
     fn gen_rand() -> Vec<u8> {  
         const RAND_SIZE: usize = 16;
-        let mut ret = Vec::with_capacity(RAND_SIZE);
-        ret.resize(RAND_SIZE, 0);
+        let mut ret = vec![0; RAND_SIZE];
         rand::thread_rng().fill(&mut ret[..]);
         ret
     }
@@ -3568,7 +3522,7 @@ impl AdnlNode {
 
     async fn graceful_close<T>(mut reader: tokio::sync::mpsc::UnboundedReceiver<T>) {
         reader.close();
-        while let Some(_) = reader.recv().await {
+        while reader.recv().await.is_some() {
         }
     }
 
@@ -3646,7 +3600,7 @@ impl AdnlNode {
                                         log::info!(
                                             target: TARGET, 
                                             "ADNL transfer {} timed out",
-                                            base64::encode(&transfer_id_wait)
+                                            base64_encode(transfer_id_wait)
                                         );
                                     }
                                     break
@@ -3678,7 +3632,7 @@ impl AdnlNode {
         };
         let msg = match new_msg.as_ref().unwrap_or(&msg) {
             AdnlMessage::Adnl_Message_Answer(answer) => {
-                self.process_answer(&answer, peers.other()).await?;
+                self.process_answer(answer, peers.other()).await?;
                 None
             },
             AdnlMessage::Adnl_Message_ConfirmChannel(confirm) => {
@@ -3732,7 +3686,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
                 )
             },
             AdnlMessage::Adnl_Message_Custom(custom) => {
-                if !Query::process_custom(subscribers, &custom, peers).await? {
+                if !Query::process_custom(subscribers, custom, peers).await? {
                     fail!("No subscribers for custom message {:?}", custom)
                 }
                 None
@@ -3745,6 +3699,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
         };
         if let Some(msg) = msg {
             let (_, repeat) = self.send_message_to_peer(msg, peers, priority)?;
+            #[allow(clippy::collapsible_else_if)]
             if priority {
                 if let MessageRepeat::NotNeeded = &repeat {
                     return Ok(())
@@ -3856,18 +3811,18 @@ println!("RECV {}", received_len);
                 log::trace!(
                     target: TARGET,
                     "Received message to unknown key ID {}", 
-                    base64::encode(&packet.buf[0..32])
+                    base64_encode(&packet.buf[0..32])
                 );
                 #[cfg(feature = "telemetry")]
                 self.telemetry.ordinary.proc_unknown.update(1);
                 return Ok(())
             },
             Subchannel::Ordinary(channel) => {
-                let version = self.decrypt_packet_from_channel(&mut packet.buf, &channel, false)?;
+                let version = self.decrypt_packet_from_channel(&mut packet.buf, channel, false)?;
                 (false, channel.local_key.clone(), Some(channel), version)
             },
             Subchannel::Priority(channel) => {
-                let version = self.decrypt_packet_from_channel(&mut packet.buf, &channel, true)?;
+                let version = self.decrypt_packet_from_channel(&mut packet.buf, channel, true)?;
                 (true, channel.local_key.clone(), Some(channel), version)
             }
         };
@@ -3876,10 +3831,7 @@ println!("RECV {}", received_len);
                 fail!("Unsupported ADNL version {}", version)
             }
         }
-        let pkt = deserialize_boxed(&packet.buf[..])?
-            .downcast::<AdnlPacketContentsBoxed>()
-            .map_err(|pkt| error!("Unsupported ADNL packet format {:?}", pkt))?
-            .only();
+        let pkt = deserialize_typed::<AdnlPacketContentsBoxed>(&packet.buf)?.only();
         let other_key = if let Some(key) = self.check_packet(
             &pkt, 
             priority, 
@@ -3923,6 +3875,7 @@ println!("RECV {}", received_len);
         if let Some(msg) = pkt.message { 
             #[cfg(feature = "telemetry")]
             let chk = self.telemetry.add_check(Telemetry::get_message_info(&msg))?;
+            #[allow(clippy::let_and_return)]
             let res = self.process_message(
                 subscribers, 
                 msg, 
@@ -4005,7 +3958,7 @@ println!("RECV {}", received_len);
                 hash: UInt256::with_array(hash.clone()),
                 total_size: data.len() as i32,
                 offset: *offset as i32,
-                data: ton::bytes(part)
+                data: part.into()
             }.into_boxed();
             *offset = next;
             ret
@@ -4147,6 +4100,7 @@ println!("RECV {}", received_len);
     ) -> Result<MessageRepeat> {
         let repeat = if priority {
             // Decide whether we need priority traffic
+            #[allow(clippy::collapsible_if)]
             if channel.is_none() {
                 // No need if no channel 
                 priority = false
@@ -4167,11 +4121,11 @@ println!("RECV {}", received_len);
             MessageRepeat::Unapplicable
         };
         let mut pkt = AdnlPacketContents {
-            rand1: ton::bytes(Self::gen_rand()),
+            rand1: Self::gen_rand().into(),
             from: if channel.is_some() {
                 None
             } else {
-                Some(source.into_public_key_tl()?)
+                Some(source.try_into()?)
             },
             from_short: if channel.is_some() {
                 None
@@ -4183,11 +4137,7 @@ println!("RECV {}", received_len);
                 )
             }, 
             message,
-            messages: if let Some(messages) = messages {
-                Some(messages.into())
-            } else {
-                None
-            },
+            messages: messages.map(|messages| messages.into()),
             address: Some(
                 self.build_address_list(Some(Version::get() + Self::TIMEOUT_ADDRESS_SEC))?
             ),
@@ -4207,7 +4157,7 @@ println!("RECV {}", received_len);
                 Some(peer.send_state.reinit_date())
             },
             signature: None,
-            rand2: ton::bytes(Self::gen_rand())
+            rand2: Self::gen_rand().into()
         };
         if channel.is_none() {
             let signature = source.sign(&serialize_boxed(&pkt.clone().into_boxed())?)?;
@@ -4250,7 +4200,7 @@ println!("RECV {}", received_len);
                 channel.encrypt_ordinary(&mut data, version)?;
             }
         } else {
-            let key = Ed25519KeyOption::generate()? as Arc<dyn KeyOption>;
+            let key = Ed25519KeyOption::generate()?;
             AdnlHandshake::build_packet(&mut data, &key, &peer.address.key, version)?;
         }
         log::trace!(
@@ -4361,7 +4311,7 @@ println!("RECV {}", received_len);
                     "Reset channel {} -> {} due to absent feedback",
                     peers.local(), peers.other()
                 );
-                self.reset_peers(&peers)?;
+                self.reset_peers(peers)?;
                 return Ok(true)
             }
         } else if ts == 0 {
@@ -4379,7 +4329,7 @@ println!("RECV {}", received_len);
     async fn update_query(
         queries: &Arc<QueryCache>, 
         query_id: QueryId,
-        answer: Option<&ton::bytes>
+        answer: Option<&[u8]>
     ) -> Result<bool> {
         let insertion = queries.insert_with(
             query_id, 
@@ -4445,13 +4395,13 @@ println!("RECV {}", received_len);
                 if let Some(data) = transfer.data.get(&received) {
                     let data = data.val();
                     received += data.len();
-                    buf.extend_from_slice(&data)
+                    buf.extend_from_slice(data)
                 } else {   
                     fail!("Invalid ADNL part transfer: parts mismatch")
                 }
             }
             if !sha256_digest(&buf).eq(transfer_id) {
-                fail!("Bad hash of ADNL transfer {}", base64::encode(transfer_id))
+                fail!("Bad hash of ADNL transfer {}", base64_encode(transfer_id))
             }
             let msg = deserialize_boxed(&buf)?
                 .downcast::<AdnlMessage>()

@@ -1,5 +1,5 @@
 /*
-* Copyright (C) 2019-2022 TON Labs. All Rights Reserved.
+* Copyright (C) 2019-2023 EverX. All Rights Reserved.
 *
 * Licensed under the SOFTWARE EVALUATION License (the "License"); you may not use
 * this file except in compliance with the License.
@@ -13,9 +13,6 @@
 
 use aes_ctr::cipher::stream::{NewStreamCipher, SyncStreamCipher};
 use core::ops::Range;
-use ever_crypto::{KeyId, Sha2, sha256_digest};
-#[cfg(any(feature = "client", feature = "server", feature = "node"))]
-use ever_crypto::KeyOption;
 use rand::Rng;
 use std::{
     fmt::Debug, hash::Hash, sync::{Arc, atomic::{AtomicU64, AtomicUsize, Ordering}},
@@ -28,7 +25,7 @@ use ton_api::{
     AnyBoxedSerialize, BoxedSerialize, deserialize_boxed_bundle, 
     IntoBoxed, serialize_boxed, serialize_boxed_append,
     ton::{
-        self, TLObject, 
+        TLObject, 
         adnl::{
             Message as AdnlMessage, 
             message::message::{
@@ -43,7 +40,9 @@ use ton_api::{
 };
 #[cfg(any(feature = "telemetry"))]
 use ton_api::ConstructorNumber;
-use ton_types::{fail, Result, UInt256};
+#[cfg(any(feature = "client", feature = "server", feature = "node"))]
+use ton_types::KeyOption;
+use ton_types::{fail, KeyId, Result, sha256_digest, sha256_digest_slices, UInt256};
 
 #[cfg(any(feature = "node", feature = "server"))]
 pub(crate) const TARGET: &str = "adnl";
@@ -139,10 +138,7 @@ impl AdnlCryptoUtils {
     /// Calculate checksum
     pub fn calc_checksum(version: &Option<u16>, data: &[u8]) -> [u8; 32] {
         if let Some(version) = version {
-            let mut sha = Sha2::new();
-            sha.update(&[(*version >> 8) as u8, *version as u8]);
-            sha.update(data);
-            sha.finalize()
+            sha256_digest_slices(&[&[(*version >> 8) as u8, *version as u8], data])
         } else {
             sha256_digest(data)
         }
@@ -151,7 +147,7 @@ impl AdnlCryptoUtils {
     /// Decode ADNL version 
     pub fn decode_version(version: &[u8; 4], hdra: &[u8], hdrb: &[u8]) -> Option<u16> {
         // Mix encoded version with other bytes of header to decode version
-        let mut xor = version.clone();
+        let mut xor = *version;
         for i in 0..hdra.len() {
             xor[i & 0x03] ^= hdra[i];
         }
@@ -245,29 +241,8 @@ impl AdnlHandshake {
         } else {
             96
         };
-/*
-        let checksum = sha256_digest(buf);
-        let len = buf.len();
-        let hdr = if version.is_some() {
-            100
-        } else {
-            96
-        };
-        buf.resize(len + hdr, 0);
-        buf[..].copy_within(..len, hdr);
-        buf[..32].copy_from_slice(other.id().data());
-        buf[32..64].copy_from_slice(local.pub_key()?);
-        let idx = if let Some(version) = version {
-            let version = AdnlCryptoUtils::encode_version(version, &buf[..64], &checksum);
-            buf[64..68].copy_from_slice(&version);
-            68
-        } else {
-            64
-        };
-        buf[idx..hdr].copy_from_slice(&checksum);
-*/
         let mut shared_secret = local.shared_secret(
-            other.pub_key()?.try_into()?
+            other.pub_key()?
         )?;
         Self::build_packet_cipher(
             &mut shared_secret,
@@ -341,16 +316,6 @@ impl AdnlHandshake {
                     buf[32..64].try_into()?
                 )?;
                 process(buf, &mut shared_secret, &range, &None)?;
-/*
-                Self::build_packet_cipher(
-                    &mut shared_secret,
-                    buf[64..96].try_into()?
-                ).apply_keystream(&mut buf[range]);
-                if !sha256_digest(&buf[96..]).eq(&buf[64..96]) {
-                    fail!("Bad handshake packet checksum");
-                }
-                buf.drain(0..96);
-*/
                 return Ok((Some(key.key().clone()), None));
             }
         }
@@ -624,7 +589,7 @@ impl Query {
         let msg = TaggedAdnlMessage {
             object: AdnlQueryMessage {
                 query_id: UInt256::with_array(query_id),
-                query: ton::bytes(query)
+                query: query.into()
             }.into_boxed(),
             #[cfg(feature = "telemetry")]
             tag: query_body.tag
@@ -656,7 +621,7 @@ impl Query {
                 |answer| TaggedAdnlMessage {
                     object: AdnlAnswerMessage {
                         query_id: query.query_id.clone(),
-                        answer: ton::bytes(answer.object)
+                        answer: answer.object.into()
                     }.into_boxed(),
                     #[cfg(feature = "telemetry")]
                     tag: answer.tag
@@ -693,7 +658,7 @@ impl Query {
                 |answer| TaggedRldpAnswer {
                     object: RldpAnswer {
                         query_id: query.query_id.clone(),
-                        data: ton::bytes(answer.object)
+                        data: answer.object.into()
                     },
                     #[cfg(feature = "telemetry")]
                     tag: answer.tag          
@@ -1057,5 +1022,5 @@ pub fn hash<T: IntoBoxed>(object: T) -> Result<[u8; 32]> {
 /// Calculate hash of TL object, boxed option
 pub fn hash_boxed<T: BoxedSerialize>(object: &T) -> Result<[u8; 32]> {
     let data = serialize_boxed(object)?;
-    Ok(sha256_digest(&data))
+    Ok(sha256_digest(data))
 }
