@@ -3206,7 +3206,13 @@ impl AdnlNode {
             }
         } 
 
-        let (ret, mut address_reinit_date, check) = if let Some(channel) = &channel {
+        let dst_reinit_date = &packet.dst_reinit_date;
+        let reinit_date = &packet.reinit_date;
+        if dst_reinit_date.is_some() != reinit_date.is_some() {
+            fail!("Destination and source reinit dates mismatch")
+        }
+
+        let (ret, address_reinit_date, check) = if let Some(channel) = &channel {
             if packet.from.is_some() || packet.from_short.is_some() {
                 fail!("Explicit source address inside channel packet")
             }
@@ -3222,8 +3228,21 @@ impl AdnlNode {
             check_signature(packet, &key, true)?;
             if let Some(address) = &packet.address {
                 if let Some(ip_address) = Self::parse_address_list(address)? {
+                    let addr_reinit_date = if let Some(reinit_date) = reinit_date {
+                        if &address.reinit_date > reinit_date {
+                            fail!(
+                                "Address and source reinit dates mismatch on {}: {} vs {}",
+                                local_key,
+                                address.reinit_date, 
+                               reinit_date
+                            )
+                        }
+                        None
+                    } else {
+                        Some(address.reinit_date)
+                    };
                     self.add_peer(local_key, &ip_address, &key)?;
-                    (other_key, Some(address.reinit_date), false)
+                    (other_key, addr_reinit_date, false)
                 } else {
                     (other_key, None, false)
                 }
@@ -3235,24 +3254,7 @@ impl AdnlNode {
         } else {
             fail!("No other key data inside packet: {:?}", packet)
         };
-        let dst_reinit_date = &packet.dst_reinit_date;
-        let reinit_date = &packet.reinit_date;
-        if dst_reinit_date.is_some() != reinit_date.is_some() {
-            fail!("Destination and source reinit dates mismatch")
-        }
-        if let Some(reinit_date) = reinit_date {
-            if let Some(addr_reinit_date) = &address_reinit_date {
-                if addr_reinit_date > reinit_date {
-                    fail!(
-                        "Address and source reinit dates mismatch on {}: {} vs {}", 
-                        local_key,
-                        addr_reinit_date, 
-                        reinit_date
-                    )
-                }
-                address_reinit_date = None
-            }
-        }
+
         let peers = self.peers(local_key)?;
         let peer = if let Some(channel) = channel {
             peers.map_of.get(&channel.other_key)
@@ -3972,6 +3974,7 @@ println!("RECV {}", received_len);
         let mut peer = peers.map_of.get(dst).ok_or_else(|| error! ("Unknown peer {}", dst))?;
         let mut channel = peers.channels_send.get(dst).map(|guard| guard.val().clone());
 
+        /* TODO turn this on after update
         if let Some(ch) = &channel {
             if let AdnlMessage::Adnl_Message_Custom(_) = &msg.object {
                 if self.try_reset_peers(ch, adnl_peers)? {
@@ -3980,6 +3983,7 @@ println!("RECV {}", received_len);
                 } 
             }
         } 
+        */
 
         let peer = peer.val();
         let src = self.key_by_id(src)?;
