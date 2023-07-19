@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## Version 0.8.19
+
+- Fix compiler warnings
+- Increase package version
+
 ## Version 0.8.18
 
 - Turn off ADNL channel reset feature to provide seamless update
