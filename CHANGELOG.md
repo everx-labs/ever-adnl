@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## Version 0.8.21
+
+- Use `thread_rng().fill` to fill buffer in  `AdnlClient::send_init_packet`
+
 ## Version 0.8.20
 
 - `AdnlClient::send_init_packet` is thread safe and can be spawned
