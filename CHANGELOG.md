@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## Version 0.8.20
+
+- `AdnlClient::send_init_packet` is thread safe and can be spawned
+
 ## Version 0.8.19
 
 - Fix compiler warnings
