@@ -193,7 +193,8 @@ impl AdnlClient {
         stream: &mut AdnlStream, 
         config: &AdnlClientConfig
     ) -> Result<AdnlStreamCrypto> {
-        let mut buf: Vec<u8> = (0..160).map(|_| rand::thread_rng().gen()).collect();
+        let mut buf = vec![0u8; 160];
+        rand::thread_rng().fill(buf.as_mut_slice());
         let nonce = buf.as_slice().try_into()?;
         let ret = AdnlStreamCrypto::with_nonce_as_client(nonce);
         if let Some(client_key) = &config.client_key {
