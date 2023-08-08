@@ -2299,11 +2299,17 @@ impl AdnlNode {
         tokio::spawn(
             async move {
                 let mut monitor_queries: Vec<(u128, QueryId)> = Vec::new();
+                let mut check = 0;
                 #[cfg(feature = "telemetry")] 
                 let mut last_check = Instant::now();
                 node_stop.stop.fetch_or(Self::MASK_WATCHDOG, atomic::Ordering::Relaxed);
                 loop {
                     tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_QUERY_STOP_MS)).await;
+                    check += Self::TIMEOUT_QUERY_STOP_MS * 1000;
+                    if check > 30000 {
+                        log::info!(target: TARGET_QUERY, "ADNL watcher active");
+                        check = 0;
+                    }
                     #[cfg(feature = "telemetry")] {
                         node_stop.telemetry.allocated.channels.update(
                             node_stop.allocated.channels.load(atomic::Ordering::Relaxed)
