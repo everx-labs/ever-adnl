@@ -62,6 +62,7 @@ pub struct AdnlServerConfig {
     address: SocketAddr,
     clients: Arc<Option<lockfree::map::Map<[u8; 32], u8>>>,
     server_key: Arc<lockfree::map::Map<Arc<KeyId>, Arc<dyn KeyOption>>>,
+    server_id: Arc<KeyId>,
     timeouts: Timeouts
 }
 
@@ -77,6 +78,7 @@ impl AdnlServerConfig {
     pub fn from_json_config(json_config: &AdnlServerConfigJson) -> Result<Self> {
         let key = Ed25519KeyOption::from_private_key_json(&json_config.server_key)?;
         let server_key = lockfree::map::Map::new();
+        let server_id = key.id().clone();
         server_key.insert(key.id().clone(), key);
         let clients = match &json_config.clients {
             AdnlServerClients::Any => None,
@@ -96,6 +98,7 @@ impl AdnlServerConfig {
             address: json_config.address.parse()?,
             clients: Arc::new(clients),
             server_key: Arc::new(server_key),
+            server_id,
             timeouts: if let Some(timeouts) = &json_config.timeouts {
                 timeouts.clone()
             } else {
@@ -110,6 +113,11 @@ impl AdnlServerConfig {
         &self.timeouts
     }
 
+    /// Get server ID
+    pub fn server_id(&self) -> &[u8; 32] {
+        self.server_id.data()
+    }
+    
 }
 
 /// ADNL server thread (one connection)
