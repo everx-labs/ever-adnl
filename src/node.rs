@@ -2292,6 +2292,30 @@ impl AdnlNode {
                 tokio::runtime::Handle::current(), 
                 subscribers
             )
+        );                       
+        // Monitoring watchdog
+        let status = Arc::new(AtomicU64::new(0));
+        let stat_mon = status.clone();                
+        let node_mon = node.clone();
+        tokio::spawn(
+            async move {
+                let mut check = 0;
+                loop {
+                    if (node_mon.stop.load(atomic::Ordering::Relaxed) & Self::MASK_STOP) != 0 {
+                        break
+                    }
+                    tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_QUERY_STOP_MS)).await;
+                    check += Self::TIMEOUT_QUERY_STOP_MS;
+                    if check > 3000 {
+                        log::info!(
+                            target: TARGET_QUERY, 
+                            "ADNL watcher, status {:010x}", 
+                            stat_mon.load(atomic::Ordering::Relaxed)
+                        );
+                        check = 0;
+                    }
+                }
+            }
         );
         // Stopping watchdog
         let node_stop = node.clone();
@@ -2299,16 +2323,14 @@ impl AdnlNode {
         tokio::spawn(
             async move {
                 let mut monitor_queries: Vec<(u128, QueryId)> = Vec::new();
-                let mut check = 0;
                 #[cfg(feature = "telemetry")] 
                 let mut last_check = Instant::now();
+                let ts_start = Instant::now();
                 node_stop.stop.fetch_or(Self::MASK_WATCHDOG, atomic::Ordering::Relaxed);
                 loop {
                     tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_QUERY_STOP_MS)).await;
-                    check += Self::TIMEOUT_QUERY_STOP_MS;
-                    if check > 5000 {
-                        log::info!(target: TARGET_QUERY, "ADNL watcher, checkpoint #1");
-                    }
+                    let ts = (ts_start.elapsed().as_secs() << 8) as u64;
+                    status.store(ts | 1, atomic::Ordering::Relaxed);
                     #[cfg(feature = "telemetry")] {
                         node_stop.telemetry.allocated.channels.update(
                             node_stop.allocated.channels.load(atomic::Ordering::Relaxed)
@@ -2331,9 +2353,7 @@ impl AdnlNode {
                             last_check = Instant::now();
                         }
                     }
-                    if check > 5000 {
-                        log::info!(target: TARGET_QUERY, "ADNL watcher, checkpoint #2");
-                    }
+                    status.store(ts | 2, atomic::Ordering::Relaxed);
                     if (node_stop.stop.load(atomic::Ordering::Relaxed) & Self::MASK_STOP) != 0 {
                         node_stop.send_pipeline.shutdown();
                         let stop = (
@@ -2357,9 +2377,7 @@ impl AdnlNode {
                         } 
                         break
                     }
-                    if check > 5000 {
-                        log::info!(target: TARGET_QUERY, "ADNL watcher, checkpoint #3");
-                    }
+                    status.store(ts | 3, atomic::Ordering::Relaxed);
                     let elapsed = start.elapsed().as_millis();
                     let mut drop = monitor_queries.len(); 
                     while drop > 0 {
@@ -2388,9 +2406,7 @@ impl AdnlNode {
                         drop -= 1;
                     };
                     monitor_queries.drain(drop..);
-                    if check > 5000 {
-                        log::info!(target: TARGET_QUERY, "ADNL watcher, checkpoint #4");
-                    }
+                    status.store(ts | 4, atomic::Ordering::Relaxed);
                     while let Some((timeout, query_id)) = node_stop.queue_monitor_queries.pop() {
                         let mut insert = monitor_queries.len();
                         let elapsed = elapsed + timeout as u128;
@@ -2403,10 +2419,7 @@ impl AdnlNode {
                         }
                         monitor_queries.insert(insert, (elapsed, query_id));
                     }
-                    if check > 5000 {
-                        log::info!(target: TARGET_QUERY, "ADNL watcher, checkpoint #5");
-                        check = 0;
-                    }
+                    status.store(ts | 5, atomic::Ordering::Relaxed);
                 }
                 node_stop.stop.fetch_and(!Self::MASK_WATCHDOG, atomic::Ordering::Relaxed);
                 log::warn!(target: TARGET, "Node stopping watchdog stopped");
