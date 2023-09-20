@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## Version 0.9.0
+
+- ADNL channel reset on
+
 ## Version 0.8.31
 
 - Introduce server ID
