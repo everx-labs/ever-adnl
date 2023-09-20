@@ -3,7 +3,7 @@ build = './common/build/build.rs'
 description = 'ADNL library'
 edition = '2021'
 name = 'adnl'
-version = '0.8.38'
+version = '0.9.0'
 
 [dependencies]
 aes-ctr = '0.6.0'

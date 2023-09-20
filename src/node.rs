@@ -4002,10 +4002,9 @@ println!("RECV {}", received_len);
         let src = adnl_peers.local();
         let dst = adnl_peers.other();
         let peers = self.peers(src)?;
-        let /*mut*/ peer = peers.map_of.get(dst).ok_or_else(|| error! ("Unknown peer {}", dst))?;
-        let /*mut*/ channel = peers.channels_send.get(dst).map(|guard| guard.val().clone());
+        let mut peer = peers.map_of.get(dst).ok_or_else(|| error! ("Unknown peer {}", dst))?;
+        let mut channel = peers.channels_send.get(dst).map(|guard| guard.val().clone());
 
-        /* TODO turn this on after update
         if let Some(ch) = &channel {
             if let AdnlMessage::Adnl_Message_Custom(_) = &msg.object {
                 if self.try_reset_peers(ch, adnl_peers)? {
@@ -4014,7 +4013,6 @@ println!("RECV {}", received_len);
                 } 
             }
         } 
-        */
 
         let peer = peer.val();
         let src = self.key_by_id(src)?;
