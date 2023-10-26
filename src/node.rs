@@ -2347,9 +2347,9 @@ impl AdnlNode {
                         node_stop.telemetry.allocated.transfers.update(
                             node_stop.allocated.transfers.load(atomic::Ordering::Relaxed)
                         );
-                        node_stop.telemetry.printer.try_print();
+                        //node_stop.telemetry.printer.try_print();
                         if last_check.elapsed().as_secs() >= Telemetry::PERIOD_AVERAGE_SEC {
-                            node_stop.telemetry.evaluate_checks();
+                            //node_stop.telemetry.evaluate_checks();
                             last_check = Instant::now();
                         }
                     }
