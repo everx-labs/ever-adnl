@@ -614,22 +614,17 @@ impl Query {
         subscribers: &[Arc<dyn Subscriber>],
         query: &AdnlQueryMessage,
         peers: &AdnlPeers                                                                    
-    ) -> Result<(bool, Option<TaggedAdnlMessage>)> {
-        if let (true, answer) = Self::process(subscribers, &query.query[..], peers).await? {
-            Self::answer(
-                answer,
-                |answer| TaggedAdnlMessage {
-                    object: AdnlAnswerMessage {
-                        query_id: query.query_id.clone(),
-                        answer: answer.object.into()
-                    }.into_boxed(),
-                    #[cfg(feature = "telemetry")]
-                    tag: answer.tag
+    ) -> Result<Option<QueryAdnlAnswer>> {
+        let ret = Self::process(subscribers, &query.query[..], peers).await?.map(
+            |answer| {
+                QueryAdnlAnswer {
+                    answer,
+                    convert: Self::convert_to_adnl_answer,
+                    query_id: query.query_id.clone() 
                 }
-            )
-        } else {
-            Ok((false, None))
-        }
+            }
+        );
+        Ok(ret)
     }
 
     /// Process custom message
@@ -649,55 +644,54 @@ impl Query {
     /// Process RLDP query
     pub async fn process_rldp(
         subscribers: &[Arc<dyn Subscriber>],
-        query: &RldpQuery,                                                               
-        peers: &AdnlPeers     
-    ) -> Result<(bool, Option<TaggedRldpAnswer>)> {
-        if let (true, answer) = Self::process(subscribers, &query.data[..], peers).await? {
-            Self::answer(
-                answer, 
-                |answer| TaggedRldpAnswer {
-                    object: RldpAnswer {
-                        query_id: query.query_id.clone(),
-                        data: answer.object.into()
-                    },
-                    #[cfg(feature = "telemetry")]
-                    tag: answer.tag          
+        query: &RldpQuery,
+        peers: &AdnlPeers
+    ) -> Result<Option<QueryRldpAnswer>> {
+        let ret = Self::process(subscribers, &query.data[..], peers).await?.map(
+            |answer| {
+                QueryRldpAnswer {
+                    answer,                                                                                 
+                    convert: Self::convert_to_rldp_answer,
+                    query_id: query.query_id.clone() 
                 }
-            )
-        } else {
-            Ok((false, None))
+            }
+        );
+        Ok(ret)
+    }
+
+    fn convert_to_adnl_answer(data: TaggedByteVec, query_id: UInt256) -> TaggedAdnlMessage {
+        TaggedAdnlMessage {
+            object: AdnlAnswerMessage {
+                query_id,
+                answer: data.object.into()
+            }.into_boxed(),
+            #[cfg(feature = "telemetry")]
+            tag: data.tag          
         }
     }
 
-    fn answer<A>(
-        answer: Option<Answer>,
-        convert: impl Fn(TaggedByteVec) -> A
-    ) -> Result<(bool, Option<A>)> {
-        let answer = match answer {
-            Some(Answer::Object(x)) => Some(
-                TaggedByteVec {
-                    object: serialize_boxed(&x.object)?,
-                    #[cfg(feature = "telemetry")]
-                    tag: x.tag
-                }
-            ),
-            Some(Answer::Raw(x)) => Some(x),
-            None => None
-        };
-        Ok((true, answer.map(convert)))
+    fn convert_to_rldp_answer(data: TaggedByteVec, query_id: UInt256) -> TaggedRldpAnswer {
+        TaggedRldpAnswer {
+            object: RldpAnswer {
+                query_id,
+                data: data.object.into()
+            },
+            #[cfg(feature = "telemetry")]
+            tag: data.tag          
+        }
     }
 
     async fn process(
         subscribers: &[Arc<dyn Subscriber>],
         query: &[u8],
         peers: &AdnlPeers
-    ) -> Result<(bool, Option<Answer>)> {
-        let mut queries = deserialize_boxed_bundle(query)?;
+    ) -> Result<Option<QueryAnswer>> {
+        let mut queries = deserialize_boxed_bundle(query)?;                   
         if queries.len() == 1 {
             let mut query = queries.remove(0);
             for subscriber in subscribers.iter() {
                 query = match subscriber.try_consume_query(query, peers).await? {
-                    QueryResult::Consumed(answer) => return Ok((true, answer)),
+                    QueryResult::Consumed(answer) => return Ok(Some(answer)),
                     QueryResult::Rejected(query) => query,
                     QueryResult::RejectedBundle(_) => unreachable!()
                 };
@@ -705,19 +699,74 @@ impl Query {
         } else {
             for subscriber in subscribers.iter() {
                 queries = match subscriber.try_consume_query_bundle(queries, peers).await? {
-                    QueryResult::Consumed(answer) => return Ok((true, answer)),
+                    QueryResult::Consumed(answer) => return Ok(Some(answer)),
                     QueryResult::Rejected(_) => unreachable!(),
                     QueryResult::RejectedBundle(queries) => queries
                 };
             }
         };
-        Ok((false, None))
+        Ok(None)
     }
 
 }
 
+/// ADNL/RLDP query answer in transit
+pub enum QueryAnswer {
+    Pending(tokio::task::JoinHandle<Result<Option<Answer>>>),
+    Ready(Option<Answer>)
+}
+
+/// ADNL/RLDP query answer finalizer 
+pub struct QueryAnswerFinalizer<A> {
+    answer: QueryAnswer,
+    convert: fn(TaggedByteVec, UInt256) -> A,
+    query_id: UInt256
+}
+
+impl <A> QueryAnswerFinalizer<A> {
+
+    pub fn try_finalize(self) -> Result<(Option<Self>, Option<A>)> {
+        let QueryAnswer::Ready(answer) = self.answer else {
+            return Ok((Some(self), None))
+        };
+        Ok((None, Self::convert(answer, self.convert, self.query_id)?))
+    }
+
+    pub async fn wait(self) -> Result<Option<A>> {
+        let answer = match self.answer {
+            QueryAnswer::Ready(answer) => answer,
+            QueryAnswer::Pending(handle) => handle.await?? 
+        };
+        Self::convert(answer, self.convert, self.query_id)
+    }
+    
+    fn convert(
+        answer: Option<Answer>,
+        convert: fn(TaggedByteVec, UInt256) -> A,
+        query_id: UInt256
+    ) -> Result<Option<A>> {
+        if let Some(answer) = answer {
+            let answer = match answer {
+                Answer::Object(x) => TaggedByteVec {
+                    object: serialize_boxed(&x.object)?,
+                    #[cfg(feature = "telemetry")]
+                    tag: x.tag
+                },
+                Answer::Raw(x) => x
+            };
+            Ok(Some((convert)(answer, query_id)))
+        } else {
+            Ok(None)
+        }
+    }
+
+}
+        
+/// Dedicated finalizers for ADNL and RLDP query answers
+pub type QueryAdnlAnswer = QueryAnswerFinalizer<TaggedAdnlMessage>;
+pub type QueryRldpAnswer = QueryAnswerFinalizer<TaggedRldpAnswer>;
+                            
 /// ADNL query cache
-//pub type QueryCache = HashMap<QueryId, Query>;
 pub type QueryCache = lockfree::map::Map<QueryId, Query>;
 
 /// ADNL query ID
@@ -726,7 +775,7 @@ pub type QueryId = [u8; 32];
 /// ADNL/RLDP query consumption result
 pub enum QueryResult {
     /// Consumed with optional answer
-    Consumed(Option<Answer>), 
+    Consumed(QueryAnswer), 
     /// Rejected 
     Rejected(TLObject),         
     /// Rejected bundle
@@ -771,7 +820,7 @@ impl QueryResult {
             #[cfg(feature = "telemetry")]
             tag
         };
-        Ok(QueryResult::Consumed(Some(Answer::Object(ret))))
+        Ok(QueryResult::Consumed(QueryAnswer::Ready(Some(Answer::Object(ret)))))
     }
 
 }

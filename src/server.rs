@@ -169,13 +169,17 @@ impl AdnlServerThread {
             let msg = deserialize_boxed(&buf[..])?
                 .downcast::<AdnlMessage>()
                 .map_err(|msg| error!("Unsupported ADNL message {:?}", msg))?;
-            let (consumed, reply) = match &msg {
+            let answer = match &msg {
                 AdnlMessage::Adnl_Message_Query(query) => 
                     Query::process_adnl(&subscribers, query, &peers).await?,
-                _ => (false, None)
+                _ => None
             };
-            if consumed {
-                if let Some(msg) = reply {
+            if let Some(answer) = answer {
+                let msg = match answer.try_finalize()? {
+                    (Some(answer), _) => answer.wait().await?,
+                    (None, msg) => msg
+                };
+                if let Some(msg) = msg {
                     serialize_boxed_inplace(&mut buf, &msg.object)?;
                     crypto.send(&mut stream, &mut buf).await?;
                 }
