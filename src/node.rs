@@ -17,7 +17,7 @@ use crate::{
         add_counted_object_to_map, add_counted_object_to_map_with_update, 
         add_unbound_object_to_map, add_unbound_object_to_map_with_update,
         AdnlCryptoUtils, AdnlHandshake, AdnlPeers, AdnlPingSubscriber, CountedObject, 
-        Counter, hash, Query, QueryCache, QueryId, Subscriber, TARGET, 
+        Counter, hash, Query, QueryAdnlAnswer, QueryCache, QueryId, Subscriber, TARGET, 
         TaggedAdnlMessage, TaggedByteSlice, TaggedTlObject, UpdatedAt, Version
     }
 };
@@ -565,7 +565,12 @@ pub struct AdnlNodeConfig {
     tags: lockfree::map::Map<usize, Arc<KeyId>>,
     recv_pipeline_pool: Option<u8>, // %% of cpu cores to assign for recv workers
     recv_priority_pool: Option<u8>, // %% of workers to assign for priority recv
-    throughput: Option<u32>
+    #[cfg(feature = "telemetry")]
+    telemetry_peer_packets: bool,
+    throughput: Option<u32>,
+    #[cfg(feature = "telemetry")]
+    timeout_check_packet_processing_mcs: u64,
+    timeout_expire_queued_packet_sec: u32
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -580,7 +585,12 @@ pub struct AdnlNodeConfigJson {
     keys: Vec<AdnlNodeKeyJson>,
     recv_pipeline_pool: Option<u8>, // %% of cpu cores to assign for recv workers
     recv_priority_pool: Option<u8>, // %% of workers to assign for priority recv
-    throughput: Option<u32>
+    #[cfg(feature = "telemetry")]
+    telemetry_peer_packets: Option<bool>,
+    throughput: Option<u32>,
+    #[cfg(feature = "telemetry")]
+    timeout_check_packet_processing_mcs: Option<u64>,
+    timeout_expire_queued_packet_sec: Option<u32>
 }
 
 impl AdnlNodeConfigJson {
@@ -608,6 +618,10 @@ impl AdnlNodeConfigJson {
 
 impl AdnlNodeConfig {
 
+    #[cfg(feature = "telemetry")]
+    const DEFAULT_TIMEOUT_CHECK_PROCESSING_MCS: u64 = 5000;    
+    const DEFAULT_TIMEOUT_EXPIRE_QUEUED_PACKET_SEC: u32 = 10;       
+
     /// Construct from IP address and key data
     pub fn from_ip_address_and_keys(
         ip_address: &str, 
@@ -619,7 +633,12 @@ impl AdnlNodeConfig {
             tags: lockfree::map::Map::new(),
             recv_pipeline_pool: None,
             recv_priority_pool: None,
-            throughput: None
+            #[cfg(feature = "telemetry")]
+            telemetry_peer_packets: false,
+            throughput: None,
+            #[cfg(feature = "telemetry")]
+            timeout_check_packet_processing_mcs: Self::DEFAULT_TIMEOUT_CHECK_PROCESSING_MCS,
+            timeout_expire_queued_packet_sec: Self::DEFAULT_TIMEOUT_EXPIRE_QUEUED_PACKET_SEC
         };
         for (key, tag) in keys {
             ret.add_key(key, tag)?;
@@ -654,7 +673,14 @@ impl AdnlNodeConfig {
             tags: lockfree::map::Map::new(),
             recv_pipeline_pool: json_config.recv_pipeline_pool,
             recv_priority_pool: json_config.recv_priority_pool,
-            throughput: json_config.throughput
+            #[cfg(feature = "telemetry")]
+            telemetry_peer_packets: json_config.telemetry_peer_packets.unwrap_or(false),
+            throughput: json_config.throughput,
+            #[cfg(feature = "telemetry")]
+            timeout_check_packet_processing_mcs:json_config.timeout_check_packet_processing_mcs
+                .unwrap_or(Self::DEFAULT_TIMEOUT_CHECK_PROCESSING_MCS),
+            timeout_expire_queued_packet_sec: json_config.timeout_expire_queued_packet_sec
+                .unwrap_or(Self::DEFAULT_TIMEOUT_EXPIRE_QUEUED_PACKET_SEC)
         };
         for key in json_config.keys.iter() {
             let data = Ed25519KeyOption::from_private_key_json(&key.data)?;
@@ -774,7 +800,12 @@ impl AdnlNodeConfig {
             keys: json_keys,
             recv_pipeline_pool: None,
             recv_priority_pool: None,
-            throughput: None
+            #[cfg(feature = "telemetry")]
+            telemetry_peer_packets: None,
+            throughput: None,
+            #[cfg(feature = "telemetry")]
+            timeout_check_packet_processing_mcs: None,
+            timeout_expire_queued_packet_sec: None
         };
         Ok((json, Self::from_ip_address_and_keys(ip_address, tags_keys)?))
     }    
@@ -965,12 +996,12 @@ impl Peer {
 
     #[cfg(feature = "telemetry")]
     fn print_state_stats(&self, state: &PeerState, local: &Arc<KeyId>) {
-        let elapsed = state.start.elapsed().as_secs();
-        let bytes = state.bytes.load(atomic::Ordering::Relaxed);
+        let elapsed = state.telemetry.start.elapsed().as_secs();
+        let bytes = state.telemetry.bytes.load(atomic::Ordering::Relaxed);
         log::info!(
             target: TARGET, 
             "ADNL STAT {} {}-{}: {} bytes, {} bytes/sec average load",
-            state.name,
+            state.telemetry.name,
             local, 
             self.address.key.id(),
             bytes,
@@ -1031,7 +1062,8 @@ enum MessageRepeat {
 
 declare_counted!(
     struct PacketBuffer {
-        buf: Vec<u8>
+        buf: Vec<u8>,
+        expired_at: u32
     }
 );
 
@@ -1268,20 +1300,21 @@ impl PeerHistory {
 
 }
 
+#[cfg(feature = "telemetry")]
+struct PeerTelemetry {
+    name: &'static str,
+    start: Instant,
+    print: AtomicU64,
+    bytes: AtomicU64,
+    packets: Option<Arc<MetricBuilder>>
+}
+
 struct PeerState {
     ordinary_history: PeerHistory,
     priority_history: PeerHistory,
     reinit_date: AtomicI32,
     #[cfg(feature = "telemetry")]
-    name: &'static str,
-    #[cfg(feature = "telemetry")]
-    start: Instant,
-    #[cfg(feature = "telemetry")]
-    print: AtomicU64,
-    #[cfg(feature = "telemetry")]
-    bytes: AtomicU64,
-    #[cfg(feature = "telemetry")]
-    packets: Arc<MetricBuilder>
+    telemetry: PeerTelemetry
 }
 
 impl PeerState {
@@ -1298,15 +1331,7 @@ impl PeerState {
             priority_history: PeerHistory::for_recv(),
             reinit_date: AtomicI32::new(reinit_date),
             #[cfg(feature = "telemetry")]
-            name: "recv",
-            #[cfg(feature = "telemetry")]
-            start: Instant::now(),
-            #[cfg(feature = "telemetry")]
-            print: AtomicU64::new(0),
-            #[cfg(feature = "telemetry")]
-            bytes: AtomicU64::new(0),
-            #[cfg(feature = "telemetry")]
-            packets: Self::add_metric(node, peers, "packets/sec", false)
+            telemetry: Self::create_telemetry(node, peers, false)
         }
     }
 
@@ -1321,15 +1346,7 @@ impl PeerState {
             priority_history: PeerHistory::for_send(),
             reinit_date: AtomicI32::new(0),
             #[cfg(feature = "telemetry")]
-            name: "send",
-            #[cfg(feature = "telemetry")]
-            start: Instant::now(),
-            #[cfg(feature = "telemetry")]
-            print: AtomicU64::new(0),
-            #[cfg(feature = "telemetry")]
-            bytes: AtomicU64::new(0),
-            #[cfg(feature = "telemetry")]
-            packets: Self::add_metric(node, peers, "packets/sec", true)
+            telemetry: Self::create_telemetry(node, peers, true)
         }
     }
 
@@ -1390,12 +1407,33 @@ impl PeerState {
     }
 
     #[cfg(feature = "telemetry")]
+    fn create_telemetry(node: &AdnlNode, peers: &AdnlPeers, for_send: bool) -> PeerTelemetry {
+        PeerTelemetry {
+            name: if for_send {
+                "send"
+            } else {
+                "recv"
+            },
+            start: Instant::now(),
+            print: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            packets: if node.config.telemetry_peer_packets {
+                Some(Self::add_metric(node, peers, "packets/sec", for_send))
+            } else {
+                None
+            }
+        }
+    }
+
+    #[cfg(feature = "telemetry")]
     fn update_stats(&self, bytes: u64) -> bool {
-        self.packets.update(1);
-        self.bytes.fetch_add(bytes, atomic::Ordering::Relaxed);
-        let elapsed = self.start.elapsed().as_secs();
-        if elapsed > self.print.load(atomic::Ordering::Relaxed) {
-            self.print.store(elapsed + 5, atomic::Ordering::Relaxed);
+        if let Some(packets) = &self.telemetry.packets {
+            packets.update(1)
+        }
+        self.telemetry.bytes.fetch_add(bytes, atomic::Ordering::Relaxed);
+        let elapsed = self.telemetry.start.elapsed().as_secs();
+        if elapsed > self.telemetry.print.load(atomic::Ordering::Relaxed) {
+            self.telemetry.print.store(elapsed + 5, atomic::Ordering::Relaxed);
             true
         } else {
             false
@@ -1536,10 +1574,16 @@ impl RecvPipeline {
     }
                                                                                                                     
     async fn get(&self) -> Option<(PacketBuffer, Subchannel, bool)> {
-        loop {
+        'again: loop {
             let ret = if let Some((data, subchannel)) = self.priority.get() {
-                self.proc_priority_packets.fetch_add(1, atomic::Ordering::Relaxed);
-                Some((data, subchannel, true))
+                if data.expired_at <= Version::get() as u32 {
+                    #[cfg(feature = "telemetry")] 
+                    self.adnl.telemetry.priority.proc_expired.update(1);
+                    continue 
+                } else {
+                    self.proc_priority_packets.fetch_add(1, atomic::Ordering::Relaxed);
+                    Some((data, subchannel, true))
+                }
             } else {
                 loop {
                     let ordinary = self.proc_ordinary_packets.load(atomic::Ordering::Relaxed);
@@ -1555,7 +1599,14 @@ impl RecvPipeline {
                         continue
                     }
                     if let Some((data, subchannel)) = self.ordinary.get() {
-                        break Some((data, subchannel, false))                    
+                        if data.expired_at <= Version::get() as u32 {
+                            #[cfg(feature = "telemetry")] 
+                            self.adnl.telemetry.ordinary.proc_expired.update(1);
+                            self.proc_ordinary_packets.fetch_sub(1, atomic::Ordering::Relaxed);
+                            continue 'again
+                        } else {
+                            break Some((data, subchannel, false))
+                        }
                     } else {
                         self.proc_ordinary_packets.fetch_sub(1, atomic::Ordering::Relaxed);
                         break None
@@ -1634,7 +1685,7 @@ impl RecvPipeline {
                     };
                     #[cfg(feature = "telemetry")] 
                     self.update_metric(priority);
-                    match self.adnl.process_packet(
+                    match self.adnl.clone().process_packet(
                         &mut packet, 
                         subchannel, 
                         &self.subscribers
@@ -1661,7 +1712,7 @@ impl RecvPipeline {
                 self.workers.fetch_sub(1, atomic::Ordering::Relaxed);
             }
         );
-    }
+    }                                                                                                                             	
 
     #[cfg(feature = "telemetry")]
     fn update_metric(&self, priority: bool) {
@@ -1803,6 +1854,7 @@ struct TelemetryAlloc {
 #[cfg(feature = "telemetry")]
 struct TelemetryByStage {
     proc_packets: Arc<Metric>,          // Packets in processing
+    proc_expired: Arc<MetricBuilder>,   // Packets expired in transit
     proc_invalid: Arc<MetricBuilder>,   // Packets with errors in processing
     proc_skipped: Arc<MetricBuilder>,   // Skipped packets (due to failed checks)
     proc_success: Arc<MetricBuilder>,   // Packets successfully processed
@@ -1823,6 +1875,9 @@ impl TelemetryByStage {
         Self {
             proc_packets: Telemetry::create_metric(
                 format!("{} packets, in progress", priority).as_str()
+            ),
+            proc_expired: Telemetry::create_metric_builder(
+                format!("proc {} expired, packets/sec", priority).as_str()
             ),
             proc_invalid: Telemetry::create_metric_builder(
                 format!("proc {} invalid, packets/sec", priority).as_str()
@@ -1874,7 +1929,6 @@ impl Telemetry {
 
     const PERIOD_AVERAGE_SEC: u64 = 5;    
     const PERIOD_MEASURE_NANO: u64 = 1000000000;    
-    const TIMEOUT_PROCESSING_MS: u64 = 500;    
 
     fn add_check(&self, info: String) -> Result<u64> {
         loop {
@@ -1918,7 +1972,7 @@ impl Telemetry {
         self.check_map.remove(&id);
     }
 
-    fn evaluate_checks(&self) {
+    fn evaluate_checks(&self, config: &AdnlNodeConfig) {
         let mut until = None;
         while let Some(id) = self.check_queue.pop() {
             if let Some(until_id) = &until {
@@ -1929,11 +1983,11 @@ impl Telemetry {
             } 
             if let Some(check) = self.check_map.get(&id) {
                 let check = check.val();
-                let elapsed = check.start.elapsed().as_millis() as u64;
-                if elapsed >= Self::TIMEOUT_PROCESSING_MS {
+                let elapsed = check.start.elapsed().as_micros() as u64;
+                if elapsed >= config.timeout_check_packet_processing_mcs {
                     log::warn!(
                         target: TARGET, 
-                        "Too long processing of {}: {} ms", 
+                        "Too long processing of {}: {} micros", 
                         check.info, 
                         elapsed
                     ) 
@@ -1956,8 +2010,17 @@ impl Telemetry {
                 "AdnlMessageConfirmChannel".to_string(),
             AdnlMessage::Adnl_Message_CreateChannel(_) =>
                 "AdnlMessageCreateChannel".to_string(),
-            AdnlMessage::Adnl_Message_Custom(custom) =>
-                format!("AdnlMessageCustom tag {:08x}", tag_from_data(&custom.data)),
+            AdnlMessage::Adnl_Message_Custom(custom) => {
+                let data = &custom.data;
+                let mut tag = tag_from_data(data);
+                // Uncover Overlay.Message internal message if possible
+                if (tag == 0x75252420) && (data.len() >= 40) {
+                    tag = tag_from_data(&data[36..]);
+                    format!("AdnlMessageCustom/OverlayMessage tag {:08x}", tag)
+                } else {
+                    format!("AdnlMessageCustom tag {:08x}", tag)
+                }
+            },
             AdnlMessage::Adnl_Message_Nop =>
                 "AdnlMessageNop".to_string(),
             AdnlMessage::Adnl_Message_Query(query) => {
@@ -2133,11 +2196,13 @@ impl AdnlNode {
                     TelemetryItem::Metric(priority.recv_queue_packets.clone()),
                     TelemetryItem::Metric(ordinary.recv_queue_packets.clone()),
                     TelemetryItem::Metric(priority.proc_packets.clone()), 
+                    TelemetryItem::MetricBuilder(priority.proc_expired.clone()),
                     TelemetryItem::MetricBuilder(priority.proc_invalid.clone()),
                     TelemetryItem::MetricBuilder(priority.proc_unknown.clone()),
                     TelemetryItem::MetricBuilder(priority.proc_skipped.clone()),
                     TelemetryItem::MetricBuilder(priority.proc_success.clone()),
                     TelemetryItem::Metric(ordinary.proc_packets.clone()),
+                    TelemetryItem::MetricBuilder(ordinary.proc_expired.clone()),
                     TelemetryItem::MetricBuilder(ordinary.proc_invalid.clone()),
                     TelemetryItem::MetricBuilder(ordinary.proc_unknown.clone()),
                     TelemetryItem::MetricBuilder(ordinary.proc_skipped.clone()),
@@ -2349,7 +2414,7 @@ impl AdnlNode {
                         );
                         node_stop.telemetry.printer.try_print();
                         if last_check.elapsed().as_secs() >= Telemetry::PERIOD_AVERAGE_SEC {
-                            node_stop.telemetry.evaluate_checks();
+                            node_stop.telemetry.evaluate_checks(&node_stop.config);
                             last_check = Instant::now();
                         }
                     }
@@ -2456,7 +2521,9 @@ impl AdnlNode {
                     node_recv.telemetry.recv_sock.update(1);
                     let mut packet = PacketBuffer {
                         buf: Vec::with_capacity(len),
-                        counter: node_recv.allocated.packets.clone().into()
+                        counter: node_recv.allocated.packets.clone().into(),
+                        expired_at: Version::get() as u32 + 
+                            node_recv.config.timeout_expire_queued_packet_sec
                     };
                     #[cfg(feature = "telemetry")]
                     node_recv.telemetry.allocated.packets.update(
@@ -2557,42 +2624,25 @@ impl AdnlNode {
                     if (node_loop.stop.load(atomic::Ordering::Relaxed) & Self::MASK_STOP) != 0 {
                         break
                     }
-                    let query = match msg {
-                        AdnlMessage::Adnl_Message_Query(query) => query,
+                    match &msg {
+                        AdnlMessage::Adnl_Message_Answer(_) => (),
+                        AdnlMessage::Adnl_Message_Custom(_) => (),
+                        AdnlMessage::Adnl_Message_Query(_) => (),
                         x => {
                             log::warn!(target: TARGET, "Unsupported local ADNL message {:?}", x);
                             continue;
                         }
-                    };
-                    let node_loop = node_loop.clone();
-                    let peers_local = AdnlPeers::with_keys(src.clone(), src.clone());
-                    let subscribers_local = subscribers_local.clone();
+                    }
+                    let node = node_loop.clone();
+                    let peers = AdnlPeers::with_keys(src.clone(), src.clone());
+                    let subscribers = subscribers_local.clone();
                     tokio::spawn(
                         async move {
-                            let answer = match Self::process_query(
-                                &subscribers_local, 
-                                &query,
-                                &peers_local,
-                                false
-                            ).await {
-                                Ok(Some(answer)) => answer,
-                                Err(e) => {
-                                    log::warn!(target: TARGET, "ERROR --> {}", e);
-                                    return
-                                },
-                                _ => return
-                            };
-                            let answer = match answer.object {
-                                AdnlMessage::Adnl_Message_Answer(answer) => answer,
-                                x => {
-                                    log::warn!(target: TARGET, "Unexpected reply {:?}", x);
-                                    return
-                                }
-                            };
-                            if let Err(e) = node_loop.process_answer(&answer, &src).await {
-                                log::warn!(target: TARGET, "ERROR --> {}", e);
+                            match node.process_message(&subscribers, msg, &peers, false).await {
+                                Err(e) => log::warn!(target: TARGET, "ERROR --> {}", e),
+                                _ => ()
                             }
-                        }            
+                        }
                     );
                 }
                 Self::graceful_close(queue_send_loopback_reader).await;
@@ -3118,7 +3168,12 @@ impl AdnlNode {
             #[cfg(feature = "telemetry")]
             tag: data.tag
         };
-        let (channel, repeat) = self.send_message_to_peer(msg, peers, false)?;
+        let (channel, repeat) = if peers.local() == peers.other() {       
+            self.queue_send_loopback_packets.send((msg.object, peers.local().clone()))?;
+            (None, MessageRepeat::Unapplicable)
+        } else {
+            self.send_message_to_peer(msg, peers, false)?
+        };
         match repeat {
             MessageRepeat::Unapplicable => Ok(AdnlStatus::with_params(false, &channel)),
             x => fail!("INTERNAL ERROR: bad repeat {:?} in ADNL custom message", x)
@@ -3552,7 +3607,7 @@ impl AdnlNode {
             peer
         )
     }
-
+                                                                                                                                                         
     async fn graceful_close<T>(mut reader: tokio::sync::mpsc::UnboundedReceiver<T>) {
         reader.close();
         while reader.recv().await.is_some() {
@@ -3590,12 +3645,37 @@ impl AdnlNode {
     }
 
     async fn process_message(
-        &self,
+        self: Arc<Self>,
         subscribers: &[Arc<dyn Subscriber>],
         msg: AdnlMessage,
         peers: &AdnlPeers,
         priority: bool
     ) -> Result<()> {
+
+        fn reply(
+            node: Arc<AdnlNode>,
+            msg: Option<TaggedAdnlMessage>,
+            peers: &AdnlPeers,
+            priority: bool
+        ) -> Result<()> {
+            if let Some(msg) = msg {
+                if peers.local() == peers.other() {       
+                    node.queue_send_loopback_packets.send((msg.object, peers.local().clone()))?;
+                    Ok(())
+                } else {
+                    match node.send_message_to_peer(msg, peers, priority)? {
+                        (_, MessageRepeat::NotNeeded) if priority => Ok(()),
+                        (_, MessageRepeat::Unapplicable) if !priority => Ok(()),
+                        (_, x) => fail!(
+                            "INTERNAL ERROR: bad repeat {:?} in answer to ADNL message", x
+                        )
+                    }
+                }
+            } else {
+                Ok(())
+            }
+        }
+
         log::trace!(target: TARGET, "Process message {:?}", msg);
         let new_msg = if let AdnlMessage::Adnl_Message_Part(part) = &msg {
             let transfer_id = part.hash.as_slice();
@@ -3726,26 +3806,40 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
             },
             AdnlMessage::Adnl_Message_Nop => None,
             AdnlMessage::Adnl_Message_Query(query) => {
-                Self::process_query(subscribers, &query, peers, priority).await?
+                let answer = Self::process_query(subscribers, &query, peers, priority).await?;
+                match answer.try_finalize()? {
+                    (Some(answer), _) => {
+                        let peers = peers.clone();
+                        let query = format!("{:?}", query);
+                        tokio::spawn(
+                            async move {
+                                match answer.wait().await {
+                                    Err(e) => log::error!(
+                                        target: TARGET, 
+                                        "Error processing ADNL query {}: {}",
+                                        query, e
+                                    ),
+                                    Ok(msg) => match reply(self, msg, &peers, priority) {
+                                        Err(e) => log::error!(
+                                            target: TARGET, 
+                                            "Error when replying to ADNL query {}: {}",
+                                            query, e
+                                        ),
+                                        _ => ()
+                                    } 
+                                }
+                            }
+                        );
+                        return Ok(())
+                    },
+                    (None, msg) => msg
+                }
             },
             _ => fail!("Unsupported ADNL message {:?}", msg)
         };
-        if let Some(msg) = msg {
-            let (_, repeat) = self.send_message_to_peer(msg, peers, priority)?;
-            #[allow(clippy::collapsible_else_if)]
-            if priority {
-                if let MessageRepeat::NotNeeded = &repeat {
-                    return Ok(())
-                }
-            } else { 
-                if let MessageRepeat::Unapplicable = &repeat {
-                    return Ok(())
-                }
-            }
-            fail!("INTERNAL ERROR: bad repeat {:?} in answer to ADNL message", repeat)
-        } else {
-            Ok(())
-        }
+
+        reply(self, msg, peers, priority)
+
     }
 
     async fn process_answer(&self, answer: &AdnlAnswerMessage, src: &Arc<KeyId>) -> Result<()> {
@@ -3761,14 +3855,14 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
         query: &AdnlQueryMessage,
         peers: &AdnlPeers,
         priority: bool
-    ) -> Result<Option<TaggedAdnlMessage>> {
+    ) -> Result<QueryAdnlAnswer> {
         let query_id = query.query_id.as_slice();
         log::info!(
             target: TARGET_QUERY, 
             "Recv {}", 
             Self::get_query_print_id(&query_id, peers.other(), priority)
         );
-        if let (true, answer) = Query::process_adnl(subscribers, query, peers).await? {
+        if let Some(answer) = Query::process_adnl(subscribers, query, peers).await? {
             log::info!(
                 target: TARGET_QUERY, 
                 "Reply to {}", 
@@ -3823,7 +3917,7 @@ log::warn!(target: TARGET, "On recv create channel in {}", channel.local_key);
     }
 
     async fn process_packet(
-        &self,                                                     
+        self: Arc<Self>,                                                      
         packet: &mut PacketBuffer,
         subchannel: Subchannel,
         subscribers: &[Arc<dyn Subscriber>],
@@ -3909,7 +4003,7 @@ println!("RECV {}", received_len);
             #[cfg(feature = "telemetry")]
             let chk = self.telemetry.add_check(Telemetry::get_message_info(&msg))?;
             #[allow(clippy::let_and_return)]
-            let res = self.process_message(
+            let res = self.clone().process_message(
                 subscribers, 
                 msg, 
                 &peers,
@@ -3923,7 +4017,7 @@ println!("RECV {}", received_len);
             for msg in msgs.0 {
                 #[cfg(feature = "telemetry")]
                 let chk = self.telemetry.add_check(Telemetry::get_message_info(&msg))?;
-                res = self.process_message(
+                res = self.clone().process_message(
                     subscribers, 
                     msg,
                     &peers,
