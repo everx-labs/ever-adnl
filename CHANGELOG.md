@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## Version 0.9.17
+
+- Remove duplicated telemetry
+
 ## Version 0.9.9
 
 - Performance improvements

@@ -1314,7 +1314,7 @@ struct PeerState {
     priority_history: PeerHistory,
     reinit_date: AtomicI32,
     #[cfg(feature = "telemetry")]
-    telemetry: PeerTelemetry
+    telemetry: Arc<PeerTelemetry>
 }
 
 impl PeerState {
@@ -1324,14 +1324,18 @@ impl PeerState {
         #[cfg(feature = "telemetry")]
         node: &AdnlNode,
         #[cfg(feature = "telemetry")]
-        peers: &AdnlPeers
+        peers: &AdnlPeers,
+        #[cfg(feature = "telemetry")]
+        telemetry: Option<Arc<PeerTelemetry>>
     ) -> Self {
         Self {
             ordinary_history: PeerHistory::for_recv(),
             priority_history: PeerHistory::for_recv(),
             reinit_date: AtomicI32::new(reinit_date),
             #[cfg(feature = "telemetry")]
-            telemetry: Self::create_telemetry(node, peers, false)
+            telemetry: telemetry.unwrap_or_else(
+                || Self::create_telemetry(node, peers, false)
+            )
         }
     }
 
@@ -1339,14 +1343,18 @@ impl PeerState {
         #[cfg(feature = "telemetry")]
         node: &AdnlNode,
         #[cfg(feature = "telemetry")]
-        peers: &AdnlPeers
+        peers: &AdnlPeers,
+        #[cfg(feature = "telemetry")]
+        telemetry: Option<Arc<PeerTelemetry>>
     ) -> Self {
         Self {
             ordinary_history: PeerHistory::for_send(),
             priority_history: PeerHistory::for_send(),
             reinit_date: AtomicI32::new(0),
             #[cfg(feature = "telemetry")]
-            telemetry: Self::create_telemetry(node, peers, true)
+            telemetry: telemetry.unwrap_or_else(
+                || Self::create_telemetry(node, peers, true)
+            )
         }
     }
 
@@ -1407,8 +1415,8 @@ impl PeerState {
     }
 
     #[cfg(feature = "telemetry")]
-    fn create_telemetry(node: &AdnlNode, peers: &AdnlPeers, for_send: bool) -> PeerTelemetry {
-        PeerTelemetry {
+    fn create_telemetry(node: &AdnlNode, peers: &AdnlPeers, for_send: bool) -> Arc<PeerTelemetry> {
+        let ret = PeerTelemetry {
             name: if for_send {
                 "send"
             } else {
@@ -1422,7 +1430,8 @@ impl PeerState {
             } else {
                 None
             }
-        }
+        };
+        Arc::new(ret)
     }
 
     #[cfg(feature = "telemetry")]
@@ -2783,13 +2792,17 @@ impl AdnlNode {
                                 #[cfg(feature = "telemetry")]
                                 self, 
                                 #[cfg(feature = "telemetry")]
-                                &peers
+                                &peers,
+                                #[cfg(feature = "telemetry")]
+                                None
                             ),
                             send_state: PeerState::for_send(
                                 #[cfg(feature = "telemetry")]
                                 self, 
                                 #[cfg(feature = "telemetry")]
-                                &peers
+                                &peers,
+                                #[cfg(feature = "telemetry")]
+                                None
                             ),
                             counter: self.allocated.peers.clone().into()
                         };
@@ -2852,8 +2865,15 @@ impl AdnlNode {
 
     /// Delete key
     pub fn delete_key(&self, key: &Arc<KeyId>, tag: usize) -> Result<bool> {
-        self.peers.remove(key);
-        self.config.delete_key(key, tag)
+        let mut ret = false;
+        if let Some(removed) = self.peers.remove(key) {
+            let removed = removed.val();
+            for peer in removed.map_of.iter() {
+                ret = self.delete_peer_from_peers(removed, peer.key())? || ret;
+            }
+        }
+        ret = self.config.delete_key(key, tag)? || ret;
+        Ok(ret)
     }
 
     /// Delete peer
@@ -2861,7 +2881,7 @@ impl AdnlNode {
         let peers = self.peers.get(local_key).ok_or_else(
             || error!("Try to remove peer {} from unknown local key {}", peer_key, local_key)
         )?;
-        Ok(peers.val().map_of.remove(peer_key).is_some())
+        self.delete_peer_from_peers(peers.val(), peer_key)
     }
 
     /// Node IP address
@@ -3124,13 +3144,17 @@ impl AdnlNode {
                             #[cfg(feature = "telemetry")]
                             self, 
                             #[cfg(feature = "telemetry")]
-                            to_reset
+                            to_reset,
+                            #[cfg(feature = "telemetry")]
+                            Some(peer.recv_state.telemetry.clone())
                         ),
                         send_state: PeerState::for_send(
                             #[cfg(feature = "telemetry")]
                             self, 
                             #[cfg(feature = "telemetry")]
-                            to_reset
+                            to_reset,
+                            #[cfg(feature = "telemetry")]
+                            Some(peer.send_state.telemetry.clone())
                         ),
                         counter: self.allocated.peers.clone().into()
                     };
@@ -3578,6 +3602,22 @@ impl AdnlNode {
             );
         }
         Ok(version)
+    }
+
+    fn delete_peer_from_peers(&self, peers: &Arc<Peers>, peer_key: &Arc<KeyId>) -> Result<bool> {
+        let Some(_removed) = peers.map_of.remove(peer_key) else {
+            return Ok(false)
+        };
+        #[cfg(feature = "telemetry")] {
+            let removed = _removed.val();
+            if let Some(item) = &removed.recv_state.telemetry.packets {
+                self.telemetry.printer.delete_metric(&item.metric().name())
+            }
+            if let Some(item) = &removed.send_state.telemetry.packets {
+                self.telemetry.printer.delete_metric(&item.metric().name())
+            }
+        }
+        Ok(true)
     }
 
     fn drop_receive_subchannels(

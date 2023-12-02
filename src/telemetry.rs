@@ -183,8 +183,8 @@ impl Metric {
     }
 
     /// Get metric name
-    pub fn name(&self) -> &str {
-        self.name.as_str()
+    pub fn name(&self) -> &String {
+        &self.name
     }
 
     /// Update metric
@@ -320,10 +320,21 @@ pub enum TelemetryItem {
     Metric(Arc<Metric>),
     MetricBuilder(Arc<MetricBuilder>)
 }
+
+impl TelemetryItem {
+    fn get_metric_name(&self) -> &String {
+        match self {
+            TelemetryItem::Metric(x) => &x.name,
+            TelemetryItem::MetricBuilder(x) => &x.metric.name
+        }
+    }
+}
     
 pub struct TelemetryPrinter {
     last: AtomicU64,
     metrics_dynamic: lockfree::queue::Queue<TelemetryItem>,
+    metrics_dynamic_active: lockfree::set::Set<String>,
+    metrics_dynamic_dropped: lockfree::set::Set<String>,
     metrics_static: Vec<TelemetryItem>,
     period_seconds: u64, 
     start: Instant
@@ -333,9 +344,12 @@ impl TelemetryPrinter {
 
     /// Constructor
     pub fn with_params(period_seconds: u64, metrics: Vec<TelemetryItem>) -> Self {
+        let incin = lockfree::set::SharedIncin::new();
         Self {
             last: AtomicU64::new(0),
             metrics_dynamic: lockfree::queue::Queue::new(),
+            metrics_dynamic_active: lockfree::set::Set::with_incin(incin.clone()),
+            metrics_dynamic_dropped: lockfree::set::Set::with_incin(incin),
             metrics_static: metrics, 
             period_seconds,                           
             start: Instant::now()
@@ -343,8 +357,25 @@ impl TelemetryPrinter {
     }
 
     /// Add dynamic metric 
-    pub fn add_metric(&self, metric: TelemetryItem) {
-        self.metrics_dynamic.push(metric)
+    pub fn add_metric(&self, metric: TelemetryItem) {                   
+        let name = metric.get_metric_name();
+        let added = if let Some(item) = self.metrics_dynamic_dropped.remove(name) {
+            self.metrics_dynamic_active.reinsert(item).is_ok()
+        } else {
+            self.metrics_dynamic_active.insert(name.clone()).is_ok()
+        };
+        if added {
+            self.metrics_dynamic.push(metric)
+        }
+    }
+
+    /// Delete dynamic metric 
+    pub fn delete_metric(&self, name: &String) {
+        if let Some(item) = self.metrics_dynamic_active.remove(name) {
+            self.metrics_dynamic_dropped.reinsert(item).ok();
+        } else {
+            self.metrics_dynamic_dropped.insert(name.clone()).ok();
+        }
     }
 
     /// Print if needed
@@ -358,11 +389,20 @@ impl TelemetryPrinter {
                 Self::print_metric(&mut out, metric)
             }
             let mut printed = Vec::new();
+            let mut dropped = Vec::new();
             while let Some(metric) = self.metrics_dynamic.pop() {
+                let name = metric.get_metric_name();
+                if self.metrics_dynamic_dropped.contains(name) {
+                    dropped.push(name.clone());
+                    continue
+                }
                 Self::print_metric(&mut out, &metric);
                 printed.push(metric);
             }
             self.metrics_dynamic.extend(printed);
+            for name in dropped.iter() {
+                self.metrics_dynamic_dropped.remove(name);
+            }
             self.last.store(elapsed + self.period_seconds, Ordering::Relaxed);
             log::info!(target: TARGET_TELEMETRY, "{}", out);
         }
