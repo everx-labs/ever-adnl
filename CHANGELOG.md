@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## Version 0.10.0
+
+- Prepare to make united crate for protocols
+
 ## Version 0.9.17
 
 - Remove duplicated telemetry
