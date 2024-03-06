@@ -11,7 +11,11 @@
 * limitations under the License.
 */
 
-mod adnl;
-pub use crate::adnl::*;
-
-include!("../common/src/info.rs");
+pub mod common;
+#[cfg(feature = "client")]
+pub mod client;
+#[cfg(feature = "server")]
+pub mod server;
+#[cfg(feature = "node")]
+pub mod node;
+pub mod telemetry;
