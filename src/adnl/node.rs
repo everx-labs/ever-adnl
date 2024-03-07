@@ -42,7 +42,7 @@ use std::{fs::{create_dir_all, OpenOptions, rename}, io::Write, path::PathBuf};
 use ton_api::{
     deserialize_boxed, deserialize_typed, IntoBoxed, serialize_boxed, 
     ton::{
-        self, TLObject,  
+        TLObject,  
         adnl::{
             Address, Message as AdnlMessage, PacketContents as AdnlPacketContentsBoxed, 
             address::address::Udp, addresslist::AddressList, id::short::Short as AdnlIdShort,  
@@ -4328,7 +4328,7 @@ println!("RECV {}", received_len);
         };
         if channel.is_none() {
             let signature = source.sign(&serialize_boxed(&pkt.clone().into_boxed())?)?;
-            pkt.signature = Some(ton::bytes(signature.to_vec()));
+            pkt.signature = Some(signature.to_vec());
         }
         #[cfg(feature = "dump")]
         let msg = if Self::need_dump(&pkt) && self.dump.is_some() {

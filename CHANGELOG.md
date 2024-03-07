@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## Version 0.10.1
+
+- Get rid of ton::bytes type
+
 ## Version 0.10.0
 
 - Prepare to make united crate for protocols
