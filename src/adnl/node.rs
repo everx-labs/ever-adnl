@@ -234,7 +234,7 @@ impl AddressCache {
         let mut check = false;
         let mut i = min(max, n);
         while i > 0 {
-            if let Some(key_id) = self.index.get(&rand::thread_rng().gen_range(0, max)) {
+            if let Some(key_id) = self.index.get(&rand::thread_rng().gen_range(0..max)) {
                 let key_id = key_id.val();
                 if let Some(skip) = skip {
                     if skip == key_id {   
@@ -268,7 +268,7 @@ impl AddressCache {
         // due to multithreading. So it is possible that all items shall be skipped, and with
         // infinite loop we will simply hang
         for _ in 0..10 {
-            if let Some(ret) = self.index.get(&rand::thread_rng().gen_range(0, max)) {
+            if let Some(ret) = self.index.get(&rand::thread_rng().gen_range(0..max)) {
                 let ret = ret.val();
                 if let Some(skip) = skip {
                     if skip.contains(ret) {

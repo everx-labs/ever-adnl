@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## Version 0.10.5
+
+- Merge DHT repo into ADNL repo (see DHT changelog in the end of this file)
+
 ## Version 0.10.4
 
 - Merge Overlay repo into ADNL repo (see Overlay changelog in the end of this file)
@@ -85,7 +89,7 @@ All notable changes to this project will be documented in this file.
 
 - Bump zstd version up (0.11)
 
-# RLDP Release Notes Archive
+# RLDP protocol Release Notes Archive
 
 ## Version 0.8.22
 
@@ -187,3 +191,74 @@ All notable changes to this project will be documented in this file.
 ## Version: 0.6.62
 
 - Added control for # of hops in broadcast
+
+# DHT protocol Release Notes Archive
+
+## Version 0.7.3
+
+- Prepare to make united crate for protocols
+
+## Version 0.7.2
+
+- Rebranding ton -> everx
+
+## Version 0.7.0
+
+- Multi-network DHT
+
+## Version 0.6.56
+
+- Support hops check for old-fashioned broadcasts
+
+## Version 0.6.25
+
+- Remove ever-crypto crate
+
+## Version 0.6.20
+
+- Small fixes for pipeline
+
+## Version 0.6.5
+
+- Use externally configured port
+
+## Version 0.6.0
+
+- Adapt to rare cases when DHT network may fail fast query at first time
+- Increase package version
+
+## Version 0.5.202
+
+- DHT performance optimization
+- Overlay node search with iterations
+- Increase package version greatly
+- Fix build due to broken dependencies
+- Adjust some comments
+- Support for different DHT search policies
+
+## Version 0.5.187
+
+- Use global config to verify on mainnet
+- Increase package version
+
+## Version 0.5.186
+
+- Limit maximum score of bad peer
+- Increase package version
+
+## Version 0.5.177
+
+- Get rid of workspace
+- Increase package version
+
+## Version: 0.5.72
+
+### New
+
+- Changed API for DHT overlay node address search
+
+## Version: 0.5.70
+
+### New
+
+- Construction of DHT node info with arbitrary timestamp
