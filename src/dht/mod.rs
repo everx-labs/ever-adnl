@@ -21,7 +21,7 @@ use crate::{
         common::{
             add_counted_object_to_map, add_counted_object_to_map_with_update, 
             add_unbound_object_to_map, AdnlPeers, CountedObject, Counter, hash, hash_boxed,
-            Query, QueryResult, Subscriber, TaggedTlObject, Version, Wait
+            Query, QueryAnswer, QueryResult, Subscriber, TaggedTlObject, Version, Wait
         }, 
         node::{AddressCache, AddressCacheIterator, AdnlNode, IpAddress}
     }
@@ -570,7 +570,13 @@ impl DhtNode {
         dst: &Arc<KeyId>, 
         network_id: Option<i32>
     ) -> Result<bool> {
-        let network = self.get_network(network_id, "Trying to find nodes in unknown DHT network")?;
+        let network = self.get_network(
+            network_id, 
+            "Trying to find nodes in unknown DHT network"
+        )?;
+        if self.adnl.check_options(AdnlNode::OPTION_LIGHTWEIGHT) {
+            return Ok(true)
+        }
         let query = TaggedTlObject {
             object: TLObject::new(
                 FindNode {
@@ -880,6 +886,9 @@ impl DhtNode {
             network_id, 
             "Trying to get signed address list in unknown DHT network"
         )?;
+        if self.adnl.check_options(AdnlNode::OPTION_LIGHTWEIGHT) {
+            return Ok(true)
+        }
         let query = TaggedTlObject {
             object: TLObject::new(GetSignedAddressList),
             #[cfg(feature = "telemetry")]
@@ -964,6 +973,13 @@ impl DhtNode {
 
     /// Store own IP address
     pub async fn store_ip_address(dht: &Arc<Self>, key: &Arc<dyn KeyOption>) -> Result<bool> {
+        let network = dht.get_network(
+            None, 
+            "Trying to store ip address in unknown DHT network"
+        )?;
+        if dht.adnl.check_options(AdnlNode::OPTION_LIGHTWEIGHT) {
+            return Ok(true)
+        }
         log::debug!(target: TARGET, "Storing key ID {}", key.id());
         let addr_list = dht.adnl.build_address_list(None)?;
         let addr = AdnlNode::parse_address_list(&addr_list)?.ok_or_else(
@@ -974,10 +990,6 @@ impl DhtNode {
         let key = Self::dht_key_from_key_id(key.id(), "address");
         let key_id = hash(key.clone())?;
         log::debug!(target: TARGET, "Storing DHT key ID {}", base64_encode(&key_id[..]));
-        let network = dht.get_network(
-            None, 
-            "Trying to store ip address in unknown DHT network"
-        )?;
         dht.process_store_signed_value(&network, key_id, value.clone())?;
         Self::store_value(
             dht,
@@ -1023,6 +1035,13 @@ impl DhtNode {
         overlay_id: &OverlayId, 
         node: &OverlayNode
     ) -> Result<bool> {
+        let network = dht.get_network(
+            None, 
+            "Trying to store overlay node in unknown DHT network"
+        )?;
+        if dht.adnl.check_options(AdnlNode::OPTION_LIGHTWEIGHT) {
+            return Ok(true)
+        }
         log::debug!(target: TARGET, "Storing overlay node {:?}", node);
         let overlay_id = Overlay {
             name: overlay_id.to_vec().into()
@@ -1044,10 +1063,6 @@ impl DhtNode {
             signature: Default::default(),
             value: serialize_boxed(&nodes)?.into()
         };
-        let network = dht.get_network(
-            None, 
-            "Trying to store overlay node in unknown DHT network"
-        )?;
         dht.process_store_overlay_nodes(&network, hash(key.clone())?, value.clone())?;
         Self::store_value(
             dht,
@@ -1694,6 +1709,9 @@ impl DhtNode {
         network: &Arc<DhtNetwork>, 
         object: TLObject
     ) -> Result<QueryResult> {
+        if self.adnl.check_options(AdnlNode::OPTION_LIGHTWEIGHT) {
+            return Ok(QueryResult::Consumed(QueryAnswer::Ready(None)))
+        }
         let object = match object.downcast::<DhtPing>() {
             Ok(query) => return QueryResult::consume(
                 self.process_ping(&query)?, 

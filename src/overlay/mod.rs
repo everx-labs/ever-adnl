@@ -1733,8 +1733,15 @@ impl OverlayNode {
         source: Option<&Arc<dyn KeyOption>>,
         allow_dup: bool
     ) -> Result<BroadcastSendInfo> {
-        log::trace!(target: TARGET, "Broadcast {} bytes", data.object.len());
         let overlay = self.get_overlay(overlay_id, "Trying broadcast to unknown overlay")?;
+        if self.adnl.check_options(AdnlNode::OPTION_LIGHTWEIGHT) {
+            let ret = BroadcastSendInfo {
+                packets: 0,
+                send_to: 0
+            };
+            return Ok(ret)
+        }
+        log::trace!(target: TARGET, "Broadcast {} bytes", data.object.len());
         let source = source.unwrap_or(&self.node_key);
         let overlay_key = overlay.overlay_key.as_ref().unwrap_or(&self.node_key).id();
         if data.object.len() <= Self::MAX_SIZE_ORDINARY_BROADCAST {
@@ -1880,6 +1887,9 @@ impl OverlayNode {
         overlay_id: &Arc<OverlayShortId>
     ) -> Result<()> {
         let overlay = self.get_overlay(overlay_id, "Sending ADNL message to unknown overlay")?;
+        if self.adnl.check_options(AdnlNode::OPTION_LIGHTWEIGHT) {
+            return Ok(())
+        }
         let src = overlay.overlay_key.as_ref().unwrap_or(&self.node_key).id();
         let peers = AdnlPeers::with_keys(src.clone(), dst.clone());
         #[cfg(feature = "telemetry")]
@@ -2269,6 +2279,8 @@ impl OverlayNode {
         BroadcastReceiver::push(&overlay.received_peers, peers); 
         if (overlay.flags & Overlay::FLAG_OVERLAY_OTHER_WORKCHAIN) != 0 {
             Ok(None)
+        } else if self.adnl.check_options(AdnlNode::OPTION_LIGHTWEIGHT) {
+            Ok(None)
         } else {
             Ok(Some(self.prepare_random_peers(overlay)?))
         }
@@ -2335,6 +2347,9 @@ impl Subscriber for OverlayNode {
         }
         if !self.check_overlay_adnl_address(&overlay, peers.local()) {
             return Ok(true)         
+        }
+        if self.adnl.check_options(AdnlNode::OPTION_LIGHTWEIGHT) {
+            return Ok(true)
         }
         #[cfg(feature = "telemetry")] {
             let (tag, _) = bundle[0].serialize_boxed();

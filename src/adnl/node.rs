@@ -2129,6 +2129,7 @@ impl AdnlNode {
     /// ADNL options
     pub const OPTION_FORCE_COMPRESSION: u32 = 0x0001; // Force traffic compression
     pub const OPTION_FORCE_VERSIONING:  u32 = 0x0002; // Force ADNL versioning
+    pub const OPTION_LIGHTWEIGHT:       u32 = 0x0004; // Lightweight operation mode
 
     /// ADNL timeouts
     pub const TIMEOUT_CHANNEL_RESET_SEC: u64 = 30;   
