@@ -24,7 +24,7 @@ use ton_api::{deserialize_boxed, deserialize_typed, serialize_boxed,
 };
 #[cfg(feature = "telemetry")]
 use ton_api::{BoxedSerialize, ConstructorNumber};
-use ton_types::{fail, Ed25519KeyOption, KeyOption, KeyOptionJson, Result};
+use ever_block::{fail, Ed25519KeyOption, KeyOption, KeyOptionJson, Result};
 
 #[derive(serde::Deserialize, serde::Serialize)]
 pub struct AdnlClientConfigJson {

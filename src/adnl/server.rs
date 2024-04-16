@@ -22,7 +22,7 @@ use std::{convert::TryInto, net::SocketAddr, sync::Arc, time::Duration};
 use stream_cancel::StreamExt;
 use futures::prelude::*;
 use ton_api::{deserialize_boxed, serialize_boxed_inplace, {ton::adnl::Message as AdnlMessage}};
-use ton_types::{
+use ever_block::{
     error, fail, base64_encode, Ed25519KeyOption, KeyId, KeyOption, KeyOptionJson, Result
 };
 

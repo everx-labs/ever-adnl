@@ -13,7 +13,6 @@
 
 // TO REMOVE AFTER FULL REBRANDING
 extern crate ton_api as ever_api;
-extern crate ton_types as ever_types;
 
 use crate::{
     declare_counted, dump, 
@@ -45,7 +44,7 @@ use ever_api::{
 };
 #[cfg(feature = "telemetry")]
 use ever_api::{tag_from_bare_object, tag_from_bare_type};
-use ever_types::{error, fail, base64_encode, KeyId, Result, UInt256};
+use ever_block::{error, fail, base64_encode, KeyId, Result, UInt256};
 use raptor_q as raptorq;
 
 const TARGET: &str = "rldp";
