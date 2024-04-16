@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## Version 0.10.18
+
+- Update of dependencies
+
 ## Version 0.10.5
 
 - Merge DHT repo into ADNL repo (see DHT changelog in the end of this file)
