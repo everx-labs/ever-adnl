@@ -41,8 +41,8 @@ use ton_api::{
 #[cfg(any(feature = "telemetry"))]
 use ton_api::ConstructorNumber;
 #[cfg(any(feature = "client", feature = "server", feature = "node"))]
-use ton_types::KeyOption;
-use ton_types::{fail, KeyId, Result, sha256_digest, sha256_digest_slices, UInt256};
+use ever_block::KeyOption;
+use ever_block::{fail, KeyId, Result, sha256_digest, sha256_digest_slices, UInt256};
 
 #[cfg(any(feature = "node", feature = "server"))]
 pub(crate) const TARGET: &str = "adnl";

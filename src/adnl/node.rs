@@ -57,7 +57,7 @@ use ton_api::{
 };
 #[cfg(feature = "telemetry")]
 use ton_api::tag_from_data;
-use ton_types::{
+use ever_block::{
     error, fail, base64_encode, Ed25519KeyOption, KeyId, KeyOption, KeyOptionJson, Result, 
     sha256_digest, UInt256
 };

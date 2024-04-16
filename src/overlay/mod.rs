@@ -13,7 +13,6 @@
 
 // TO REMOVE AFTER FULL REBRANDING
 extern crate ton_api as ever_api;
-extern crate ton_types as ever_types;
 
 use crate::{
     declare_counted,
@@ -68,7 +67,7 @@ use ever_api::{
 };
 #[cfg(feature = "telemetry")]
 use ever_api::{BoxedSerialize, tag_from_boxed_type, tag_from_bare_type};
-use ever_types::{
+use ever_block::{
     error, fail, 
     base64_decode, base64_encode, KeyId, KeyOption, Result, sha256_digest, UInt256
 };
