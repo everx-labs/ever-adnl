@@ -1,12 +1,10 @@
-<p align="center">
-  <a href="https://github.com/venom-blockchain/developer-program">
-    <img src="https://raw.githubusercontent.com/venom-blockchain/developer-program/main/vf-dev-program.png" alt="Logo" width="366.8" height="146.4">
-  </a>
-</p>
-
 # ADNL
 
-ADNL protocol implementation (UDP & TCP)
+ADNL protocol stack implementation (UDP & TCP), including:
+- ADNL (Abstract Datagram Network Layer) itself
+- RLDP (Reliable Large Datagram Protocol)
+- Overlay protocol
+- DHT protocol
 
 ## Table of Contents
 
@@ -18,13 +16,18 @@ ADNL protocol implementation (UDP & TCP)
 
 ## About
 
-Implementation of Abstract Datagram Network Layer (ADNL) Protocol in safe Rust. ADNL is a protocol that provides all low level communications between Everscale/Venom blockshain nodes. Depending on scenario, ADNL can operate on top of UDP or TCP protocols.
+Implementation of Abstract Datagram Network Layer (ADNL) protocol stack in safe Rust. ADNL is a protocol layer that provides all low level communications between Everscale/Venom blockshain nodes. Depending on scenario, ADNL can operate on top of UDP or TCP protocols. 
+
+Stack implementation includes several other protocols accompanying ADNL in node operation. Specifically:
+- Reliable Large Datagram Protocol (RLDP). RLDP is a protocol that runs on top of ADNL UDP, which is used to transfer large data blocks and includes Forward Error Correction (FEC) algorithms as a replacement of acknowledgment packets on the other side. This makes it possible to transfer data between network components more efficiently, but with more traffic consumption.
+- Overlay protocol. This protocol runs on top of ADNL UDP, and it is responsible for dividing a single network into additional subnetworks (overlays). Overlays can be both public, to which anyone can connect, and private, where additional credentials is needed for entry, known only to a certain amount of participants.
+- Distributed Hash Table (DHT) Protocol. DHT protocol essentially manages the distributed key-value database, where each member of the network can store something, for example, information about themselves.
 
 ## Getting Started
 
 ### Prerequisites
 
-Rust complier v1.65+.
+Rust complier v1.76+.
 
 ### Installing
 

@@ -1,37 +1,40 @@
 [package]
 build = './common/build/build.rs'
-description = 'ADNL library'
+description = 'ADNL stack library'
 edition = '2021'
 name = 'adnl'
-version = '0.9.17'
+version = '0.10.23'
 
 [dependencies]
 aes-ctr = '0.6.0'
-async-trait = '0.1.22'
-enum-as-inner = '=0.5.1'
-failure = '0.1.6'
-futures = '0.3.1'
-log = '0.4'
-num_cpus = '1.13'
-rand = '0.7'
-serde_json = '1.0.41'
-socket2 = '0.3.19'
-stream-cancel = '0.8.0'
-tokio-io-timeout = '1.1.1'
+async-trait = '0.1'
 chrono = { optional = true, version = '0.4' }
-external-ip = { optional = true, version = '4.1.0' }
-lockfree = { git = 'https://github.com/tonlabs/lockfree.git' }
+enum-as-inner = '=0.5.1'
+external-ip = { optional = true, version = '4.1' }
+failure = '0.1'
+futures = '0.3.1'
+hex = '0.4'
+log = '0.4'
+num-traits = '0.2'
+num_cpus = '1.13'
+rand = '0.8'
 serde = { features = [ 'derive', 'rc' ], version = '1.0.105' }
-tokio = { features = [ 'io-util', 'macros', 'net', 'rt-multi-thread' ], version = '1.5.0' }
+serde_json = '1.0'
+socket2 = '0.3'
+stream-cancel = '0.8.0'
+tokio = { features = [ 'io-util', 'macros', 'net', 'rt-multi-thread' ], version = '1.5' }
+tokio-io-timeout = '1.1.1'
 tokio-stream = { features = [ 'net' ], version = '0.1.4' }
-ton_api = { git = 'https://github.com/tonlabs/ever-tl.git', package = 'ton_api', tag = 'pre_feature-common-message' }
-ton_types = { git = 'https://github.com/tonlabs/ever-types.git', tag = 'pre_feature-common-message' }
 zstd = { features = [ 'pkg-config' ], version = '0.11' }
+ever_block = { features = [ 'export_key' ], git = 'https://github.com/everx-labs/ever-block.git', branch = 'feature-mesh' }
+lockfree = { git = 'https://github.com/everx-labs/lockfree.git' }
+raptor-q = { path = 'raptorq', version = '1.2.1' }
+ton_api = { git = 'https://github.com/everx-labs/ever-tl.git', package = 'ton_api', branch = 'feature-mesh' }
 
 [features]
 client = [  ]
 debug = [  ]
-default = [ 'static_workers' ]
+default = [ 'node', 'static_workers' ]
 dump = [ 'chrono' ]
 node = [ 'external-ip' ]
 server = [  ]

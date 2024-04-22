@@ -11,13 +11,11 @@
 * limitations under the License.
 */
 
-mod adnl;
-pub use crate::adnl::*;
-mod dht;
-pub use crate::dht::*;
-mod overlay;
-pub use crate::overlay::*;
-mod rldp;
-pub use crate::rldp::*;
-
-include!("../common/src/info.rs");
+pub mod common;
+#[cfg(feature = "client")]
+pub mod client;
+#[cfg(feature = "server")]
+pub mod server;
+#[cfg(feature = "node")]
+pub mod node;
+pub mod telemetry;

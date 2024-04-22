@@ -42,7 +42,7 @@ use std::{fs::{create_dir_all, OpenOptions, rename}, io::Write, path::PathBuf};
 use ton_api::{
     deserialize_boxed, deserialize_typed, IntoBoxed, serialize_boxed, 
     ton::{
-        self, TLObject,  
+        TLObject,  
         adnl::{
             Address, Message as AdnlMessage, PacketContents as AdnlPacketContentsBoxed, 
             address::address::Udp, addresslist::AddressList, id::short::Short as AdnlIdShort,  
@@ -57,7 +57,7 @@ use ton_api::{
 };
 #[cfg(feature = "telemetry")]
 use ton_api::tag_from_data;
-use ton_types::{
+use ever_block::{
     error, fail, base64_encode, Ed25519KeyOption, KeyId, KeyOption, KeyOptionJson, Result, 
     sha256_digest, UInt256
 };
@@ -234,7 +234,7 @@ impl AddressCache {
         let mut check = false;
         let mut i = min(max, n);
         while i > 0 {
-            if let Some(key_id) = self.index.get(&rand::thread_rng().gen_range(0, max)) {
+            if let Some(key_id) = self.index.get(&rand::thread_rng().gen_range(0..max)) {
                 let key_id = key_id.val();
                 if let Some(skip) = skip {
                     if skip == key_id {   
@@ -268,7 +268,7 @@ impl AddressCache {
         // due to multithreading. So it is possible that all items shall be skipped, and with
         // infinite loop we will simply hang
         for _ in 0..10 {
-            if let Some(ret) = self.index.get(&rand::thread_rng().gen_range(0, max)) {
+            if let Some(ret) = self.index.get(&rand::thread_rng().gen_range(0..max)) {
                 let ret = ret.val();
                 if let Some(skip) = skip {
                     if skip.contains(ret) {
@@ -4328,7 +4328,7 @@ println!("RECV {}", received_len);
         };
         if channel.is_none() {
             let signature = source.sign(&serialize_boxed(&pkt.clone().into_boxed())?)?;
-            pkt.signature = Some(ton::bytes(signature.to_vec()));
+            pkt.signature = Some(signature.to_vec());
         }
         #[cfg(feature = "dump")]
         let msg = if Self::need_dump(&pkt) && self.dump.is_some() {
