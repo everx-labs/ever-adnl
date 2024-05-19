@@ -121,7 +121,7 @@ impl AdnlServerConfig {
 }
 
 /// ADNL server thread (one connection)
-struct AdnlServerThread(Arc<Vec<Arc<dyn Subscriber>>>);
+struct AdnlServerThread;
 
 impl AdnlServerThread {
 

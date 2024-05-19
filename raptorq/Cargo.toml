@@ -19,6 +19,7 @@ wasm-bindgen = { optional = true, version = '0.2' }
 [features]
 benchmarking = [ 'std' ]
 default = [ 'std' ]
+dummy_code = [  ]
 python = [ 'pyo3', 'std' ]
 serde_support = [ 'serde', 'std' ]
 std = [  ]

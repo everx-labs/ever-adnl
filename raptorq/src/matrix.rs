@@ -1,7 +1,9 @@
 #[cfg(feature = "std")]
-use std::{mem::size_of, vec::Vec};
+use std::vec::Vec;
+#[cfg(all(feature = "std", feature = "dummy_code"))]
+use std::mem::size_of;
 
-#[cfg(not(feature = "std"))]
+#[cfg(all(not(feature = "std"), feature = "dummy_code"))]
 use core::mem::size_of;
 
 #[cfg(not(feature = "std"))]
@@ -23,6 +25,7 @@ pub trait BinaryMatrix: Clone {
 
     fn width(&self) -> usize;
 
+    #[cfg(feature = "dummy_code")]
     fn size_in_bytes(&self) -> usize;
 
     fn count_ones(&self, row: usize, start_col: usize, end_col: usize) -> usize;
@@ -142,11 +145,11 @@ impl BinaryMatrix for DenseBinaryMatrix {
         self.width
     }
 
+    #[cfg(feature = "dummy_code")]
     fn size_in_bytes(&self) -> usize {
         let mut bytes = size_of::<Self>();
         bytes += size_of::<Vec<u64>>();
         bytes += size_of::<u64>() * self.elements.len();
-
         bytes
     }
 

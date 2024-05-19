@@ -5,7 +5,7 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 
 #[cfg(not(any(feature = "python", feature = "wasm")))]
-use raptorq::{Decoder, Encoder, EncodingPacket};
+use raptor_q::{Decoder, Encoder, EncodingPacket};
 
 #[cfg(not(any(feature = "python", feature = "wasm")))]
 fn main() {
