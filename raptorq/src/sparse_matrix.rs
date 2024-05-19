@@ -1,7 +1,9 @@
 #[cfg(feature = "std")]
-use std::{mem::size_of, vec::Vec};
+use std::vec::Vec;
+#[cfg(all(feature = "std", feature = "dummy_code"))]
+use std::mem::size_of;
 
-#[cfg(not(feature = "std"))]
+#[cfg(all(not(feature = "std"), feature = "dummy_code"))]
 use core::mem::size_of;
 
 #[cfg(not(feature = "std"))]
@@ -475,6 +477,7 @@ impl BinaryMatrix for SparseBinaryMatrix {
         self.verify();
     }
 
+    #[cfg(feature = "dummy_code")]
     fn size_in_bytes(&self) -> usize {
         let mut bytes = size_of::<Self>();
         for x in self.sparse_elements.iter() {
@@ -492,8 +495,8 @@ impl BinaryMatrix for SparseBinaryMatrix {
         {
             bytes += size_of::<bool>() * self.debug_indexed_column_valid.len();
         }
-
         bytes
     }
+
 }
 

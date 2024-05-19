@@ -1,8 +1,12 @@
 #[cfg(feature = "std")]
-use std::{mem::size_of, ops::Range, u32, vec::Vec};
+use std::{ops::Range, u32, vec::Vec};
+#[cfg(all(feature = "std", feature = "dummy_code"))]
+use std::mem::size_of;
 
 #[cfg(not(feature = "std"))]
-use core::{mem::size_of, ops::Range, u32};
+use core::{ops::Range, u32};
+#[cfg(all(not(feature = "std"), feature = "dummy_code"))]
+use core::mem::size_of;
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
@@ -27,13 +31,14 @@ impl ImmutableListMap {
         &self.values[start..end]
     }
 
+    #[cfg(feature = "dummy_code")]
     pub fn size_in_bytes(&self) -> usize {
         let mut bytes = size_of::<Self>();
         bytes += size_of::<u32>() * self.offsets.len();
         bytes += size_of::<u32>() * self.values.len();
-
         bytes
     }
+
 }
 
 pub struct ImmutableListMapBuilder {
@@ -178,6 +183,7 @@ impl U16ArrayMap {
         }
     }
 
+    #[cfg(feature = "dummy_code")]
     pub fn size_in_bytes(&self) -> usize {
         size_of::<Self>() + size_of::<u16>() * self.elements.len()
     }
@@ -235,6 +241,7 @@ impl U32VecMap {
         }
     }
 
+    #[cfg(feature = "dummy_code")]
     pub fn size_in_bytes(&self) -> usize {
         size_of::<Self>() + size_of::<u32>() * self.elements.len()
     }

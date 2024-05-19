@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## Version 0.10.27
+
+- Configure broadcast parameters
+
 ## Version 0.10.19
 
 - Supported merge of block and types repos

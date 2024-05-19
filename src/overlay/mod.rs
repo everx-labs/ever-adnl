@@ -327,6 +327,8 @@ impl Overlay {
     const MAX_HOPS: u8 = 15;
     const OPTION_DISABLE_BROADCAST_RETRANSMIT: u32 = 0x01;
     const SIZE_BROADCAST_WAVE: u32 = 20;
+    const SIZE_NEIGHBOURS_LONG_BROADCAST: u8 = 5;
+    const SIZE_NEIGHBOURS_SHORT_BROADCAST: u8 = 3;
     const SPINNER: u64 = 10;              // Milliseconds
     const TIMEOUT_BROADCAST: u64 = 60;    // Seconds
 
@@ -692,7 +694,11 @@ impl Overlay {
 
         let overlay = overlay.clone();
         let overlay_key = overlay_key.clone();
-        let (hops, neighbours) = overlay.calc_broadcast_neighbours(overlay.hops, 5, None)?;
+        let (hops, neighbours) = overlay.calc_broadcast_neighbours(
+            overlay.hops,  
+            Self::SIZE_NEIGHBOURS_LONG_BROADCAST, 
+            None
+        )?;
         let ret = BroadcastSendInfo {
             packets: max_seqno,
             send_to: neighbours.len() as u32
@@ -967,16 +973,20 @@ impl Overlay {
         };
         log::trace!(target: TARGET, "Received overlay broadcast, {} bytes", data.len());
         #[cfg(feature = "telemetry")]
-        if data.len() >= 4 {
+        let tag = if data.len() >= 4 {
+            let tag = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
             log::info!(
                 target: TARGET_BROADCAST,
                 "Broadcast trace: recv ordinary {} {} bytes, tag {:08x} to overlay {}",
                 base64_encode(&bcast_id),  
                 data.len(),
-                u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+                tag,
                 overlay.overlay_id
             );
-        }
+            tag
+        } else {
+            overlay.tag_broadcast_ord
+        };
         BroadcastReceiver::push(
             &overlay.received_rawbytes,
             BroadcastRecvInfo {
@@ -989,11 +999,11 @@ impl Overlay {
             raw_data,
             check_hops,
             peers,
-            3, 
+            Self::SIZE_NEIGHBOURS_SHORT_BROADCAST, 
             #[cfg(feature = "telemetry")]
             None,
             #[cfg(feature = "telemetry")]
-            overlay.tag_broadcast_ord
+            tag
         ).await?;
         Self::setup_broadcast_purge(overlay, bcast_id);
         Ok(())
@@ -1104,7 +1114,7 @@ impl Overlay {
             raw_data,
             check_hops,
             peers,
-            5, 
+            Self::SIZE_NEIGHBOURS_LONG_BROADCAST, 
             #[cfg(feature = "telemetry")]
             Some(stats.val()),
             #[cfg(feature = "telemetry")]
@@ -1216,7 +1226,11 @@ impl Overlay {
         }.into_boxed();
         let mut buf = overlay.message_prefix.clone();
         serialize_boxed_append(&mut buf, &bcast)?;
-        let (hops, neighbours) = overlay.calc_broadcast_neighbours(overlay.hops, 3, None)?;
+        let (hops, neighbours) = overlay.calc_broadcast_neighbours(
+            overlay.hops,
+            Self::SIZE_NEIGHBOURS_SHORT_BROADCAST,
+            None
+        )?;
         if let Some(hops) = hops {  
             buf.push(hops);
         }
@@ -1480,14 +1494,9 @@ declare_counted!(
     }
 );
 
-#[async_trait::async_trait]
-pub trait QueriesConsumer: Send + Sync {
-    async fn try_consume_query(&self, query: TLObject, peers: &AdnlPeers) -> Result<QueryResult>;
-}
-
 declare_counted!(
     struct ConsumerObject {
-        object: Arc<dyn QueriesConsumer>
+        object: Arc<dyn Subscriber>
     }
 );
 
@@ -1584,11 +1593,11 @@ impl OverlayNode {
         Ok(Arc::new(ret))
     }
 
-    /// Add overlay query consumer
+    /// Add overlay data consumer
     pub fn add_consumer(
         &self, 
         overlay_id: &Arc<OverlayShortId>, 
-        consumer: Arc<dyn QueriesConsumer>
+        consumer: Arc<dyn Subscriber>
     ) -> Result<bool> {
         log::debug!(target: TARGET, "Add consumer {} to overlay", overlay_id);
         add_counted_object_to_map(
@@ -2403,8 +2412,15 @@ impl Subscriber for OverlayNode {
                 Ok(bcast) => fail!("Unsupported overlay broadcast message {:?}", bcast),
                 Err(message) => message,
             };
-            // Unknown message
-            fail!("Unsupported overlay message {:?}", message)
+            let consumer = if let Some(consumer) = self.consumers.get(&overlay_id) {
+                consumer.val().object.clone()
+            } else {
+                fail!("No dedicated consumer for message {:?} in overlay {}", message, overlay_id)
+            };
+            match consumer.try_consume_object(message, peers).await {
+                Err(msg) => fail!("Unsupported message {} in overlay {}", msg, overlay_id),
+                r => r
+            }
         }
     }
 
@@ -2456,10 +2472,10 @@ impl Subscriber for OverlayNode {
         let consumer = if let Some(consumer) = self.consumers.get(&overlay_id) {
             consumer.val().object.clone()
         } else {
-            fail!("No consumer for message in overlay {}", overlay_id)
+            fail!("No dedicated consumer for query {:?} in overlay {}", object, overlay_id)
         };
         match consumer.try_consume_query(object, peers).await {
-            Err(msg) => fail!("Unsupported query, overlay: {}, query: {}", overlay_id, msg),
+            Err(msg) => fail!("Unsupported query {} in overlay {}", msg, overlay_id),
             r => r
         }
     }

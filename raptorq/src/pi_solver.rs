@@ -1,11 +1,15 @@
 #[cfg(feature = "std")]
-use std::{mem, mem::size_of, u16, vec::Vec};
+use std::{mem, u16, vec::Vec};
+#[cfg(all(feature = "std", feature = "dummy_code"))]
+use std::mem::size_of;
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
 #[cfg(not(feature = "std"))]
-use core::{mem, mem::size_of, u16};
+use core::{mem, u16};
+#[cfg(all(not(feature = "std"), feature = "dummy_code"))]
+use core::mem::size_of;
 
 use crate::arraymap::UndirectedGraph;
 use crate::arraymap::{U16ArrayMap, U32VecMap};
@@ -76,14 +80,12 @@ impl FirstPhaseRowSelectionStats {
         result
     }
 
-    #[allow(dead_code)]
+    #[cfg(feature = "dummy_code")]
     pub fn size_in_bytes(&self) -> usize {
         let mut bytes = size_of::<Self>();
-
         bytes += self.original_degree.size_in_bytes();
         bytes += self.ones_per_row.size_in_bytes();
         bytes += self.ones_histogram.size_in_bytes();
-
         bytes
     }
 

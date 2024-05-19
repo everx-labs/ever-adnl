@@ -835,6 +835,10 @@ pub trait Subscriber: Send + Sync {
     async fn try_consume_custom(&self, _data: &[u8], _peers: &AdnlPeers) -> Result<bool> {
         Ok(false)
     }
+    /// Try consume TL object: object -> consumed yes/no
+    async fn try_consume_object(&self, _object: TLObject, _peers: &AdnlPeers) -> Result<bool> {
+        Ok(false)
+    }
     /// Try consume query: object -> result
     async fn try_consume_query(
         &self, 
