@@ -702,7 +702,7 @@ impl DhtNode {
                 }
                 while let Some((_, nodes_list)) = nodes_lists.pop() {
                     if let Ok(nodes_list) = nodes_list.downcast::<OverlayNodesBoxed>() {
-                        for node in nodes_list.only().nodes.0 {
+                        for node in nodes_list.only().nodes {
                             let key: Arc<dyn KeyOption> = (&node.id).try_into()?;
                             ctx_search.search.push_back(
                                 OverlayNodeResolveContext {
@@ -1057,7 +1057,7 @@ impl DhtNode {
             |mut objects| {
                 while let Some((_, object)) = objects.pop() {
                     if let Ok(nodes_list) = object.downcast::<OverlayNodesBoxed>() {
-                        for found_node in nodes_list.only().nodes.0 {
+                        for found_node in nodes_list.only().nodes {
                             if &found_node == node {
                                 log::debug!(target: TARGET, "Checked stored node {:?}", node);
                                 return Ok(true);
@@ -1179,7 +1179,7 @@ impl DhtNode {
         let nodes = deserialize_boxed(value)?
             .downcast::<OverlayNodesBoxed>()
             .map_err(|object| error!("Wrong OverlayNodes: {:?}", object))?;
-        Ok(nodes.only().nodes.0)
+        Ok(nodes.only().nodes)
     }
 
     fn dht_key_from_key_id(id: &Arc<KeyId>, name: &str) -> DhtKey {

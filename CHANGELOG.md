@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## Version 0.10.29
+
+- Refactor TL vector interface
+
 ## Version 0.10.28
 
 - Update dependencies

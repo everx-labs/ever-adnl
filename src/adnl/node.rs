@@ -4054,7 +4054,7 @@ println!("RECV {}", received_len);
             res
         } else if let Some(msgs) = pkt.messages {
             let mut res = Ok(());
-            for msg in msgs.0 {
+            for msg in msgs {
                 #[cfg(feature = "telemetry")]
                 let chk = self.telemetry.add_check(Telemetry::get_message_info(&msg))?;
                 res = self.clone().process_message(
