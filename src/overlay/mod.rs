@@ -2251,7 +2251,7 @@ impl OverlayNode {
     ) -> Result<Vec<Node>> {
         let mut ret = Vec::new();
         log::trace!(target: TARGET, "-------- Got random peers:");
-        let mut peers = peers.nodes.0;
+        let mut peers = peers.nodes;
         while let Some(peer) = peers.pop() {
             let other_key: Arc<dyn KeyOption> = (&peer.id).try_into()?;
             if self.node_key.id().data() == other_key.id().data() {
