@@ -3,15 +3,15 @@ build = './common/build/build.rs'
 description = 'ADNL stack library'
 edition = '2021'
 name = 'adnl'
-version = '0.10.30'
+version = '0.11.1'
 
 [dependencies]
 aes-ctr = '0.6.0'
+anyhow = '1.0'
 async-trait = '0.1'
 chrono = { optional = true, version = '0.4' }
 enum-as-inner = '=0.5.1'
 external-ip = { optional = true, version = '5' }
-failure = '0.1'
 futures = '0.3.1'
 hex = '0.4'
 log = '0.4'
@@ -26,10 +26,10 @@ tokio = { features = [ 'io-util', 'macros', 'net', 'rt-multi-thread' ], version 
 tokio-io-timeout = '1.1.1'
 tokio-stream = { features = [ 'net' ], version = '0.1.4' }
 zstd = { features = [ 'pkg-config' ], version = '0.11' }
-ever_block = { features = [ 'export_key' ], git = 'https://github.com/everx-labs/ever-block.git', tag = '1.10.4' }
+ever_block = { features = [ 'export_key' ], git = 'https://github.com/everx-labs/ever-block.git', tag = '1.11.0' }
 lockfree = { git = 'https://github.com/everx-labs/lockfree.git' }
 raptor-q = { path = 'raptorq', version = '1.2.1' }
-ton_api = { git = 'https://github.com/everx-labs/ever-tl.git', package = 'ton_api', tag = '0.3.83' }
+ton_api = { git = 'https://github.com/everx-labs/ever-tl.git', package = 'ton_api', tag = '0.4.1' }
 
 [features]
 client = [  ]
