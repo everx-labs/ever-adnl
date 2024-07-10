@@ -29,8 +29,8 @@ use crate::adnl::telemetry::Metric;
 use crate::rldp::{Constraints, RaptorqDecoder, RaptorqEncoder, RldpNode};
 use num_traits::pow::Pow;
 use std::{
-    convert::TryInto, sync::{Arc, atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}},
-    time::Duration
+    cmp::min, convert::TryInto, 
+    sync::{Arc, atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}}, time::Duration
 };
 #[cfg(feature = "telemetry")]
 use std::time::Instant;
@@ -756,7 +756,7 @@ impl Overlay {
         let mut addrs = Vec::new();
         for neighbour in neighbours.iter() {
             #[cfg(feature = "telemetry")]
-            if let Err(e) = self.update_stats(neighbour, data.tag, true) {
+            if let Err(e) = self.update_stats(neighbour, data.tag, true).await {
                 log::warn!(
                     target: TARGET,
                     "Cannot update statistics in overlay {} for {} during broadcast: {}",
@@ -1264,7 +1264,13 @@ impl Overlay {
 
     fn update_neighbours(&self, n: u32) -> Result<()> {
         if self.overlay_key.is_some() {
-            self.known_peers.random_set(&self.neighbours, None, n)
+            let n = min(self.known_peers.count(), n);
+            loop {
+                self.known_peers.random_set(&self.neighbours, None, n)?;
+                if self.neighbours.count() >= n {
+                    break Ok(())
+                }
+            }
         } else {
             self.known_peers.random_set(&self.neighbours, Some(&self.bad_peers), n)
 //            self.random_peers.random_set(&self.neighbours, Some(&self.bad_peers), n)
@@ -1394,7 +1400,18 @@ impl Overlay {
     }
 
     #[cfg(feature = "telemetry")]
-    fn update_stats(&self, dst: &Arc<KeyId>, tag: u32, is_send: bool) -> Result<()> {
+    async fn update_stats(&self, dst: &Arc<KeyId>, tag: u32, is_send: bool) -> Result<()> {
+        const PRINT_BIT: u64 = 1 << 63;
+        let elapsed = self.start.elapsed().as_secs();
+        let printed = loop {
+            let printed = self.print.fetch_max(elapsed, Ordering::Relaxed);
+            if (printed & PRINT_BIT) != 0 {
+                // In print now, wait
+                tokio::task::yield_now().await;
+            } else {
+                break printed
+            }
+        };        
         let stats = if is_send {
             &self.stats_per_peer_send
         } else {
@@ -1450,10 +1467,26 @@ impl Overlay {
         } else {
             self.messages_recv.fetch_add(1, Ordering::Relaxed);
         }
-        let elapsed = self.start.elapsed().as_secs();
-        if elapsed > self.print.load(Ordering::Relaxed) {
-            self.print.store(elapsed + 5, Ordering::Relaxed);
-            self.print_stats()?;
+        drop(stats);
+        if printed == elapsed {
+            // Exceeded assigned time 
+            let next = elapsed + 5;
+            if self.print.compare_exchange(
+                printed, 
+                next | PRINT_BIT, 
+                Ordering::Relaxed, 
+                Ordering::Relaxed
+            ).is_ok() {
+                // Print only once
+                let ret = self.print_stats();
+                self.print.compare_exchange(
+                    next | PRINT_BIT, 
+                    next, 
+                    Ordering::Relaxed, 
+                    Ordering::Relaxed
+                ).ok();
+                ret?;
+            }
         }
         Ok(())
     }
@@ -1891,7 +1924,7 @@ impl OverlayNode {
         let src = overlay.overlay_key.as_ref().unwrap_or(&self.node_key).id();
         let peers = AdnlPeers::with_keys(src.clone(), dst.clone());
         #[cfg(feature = "telemetry")]
-        overlay.update_stats(dst, data.tag, true)?;
+        overlay.update_stats(dst, data.tag, true).await?;
         let mut buf = overlay.message_prefix.clone();
         buf.extend_from_slice(data.object);
         self.adnl.send_custom(
@@ -1916,7 +1949,7 @@ impl OverlayNode {
         let src = overlay.overlay_key.as_ref().unwrap_or(&self.node_key).id();
         let peers = AdnlPeers::with_keys(src.clone(), dst.clone());
         #[cfg(feature = "telemetry")] 
-        overlay.update_stats(dst, query.tag, true)?;
+        overlay.update_stats(dst, query.tag, true).await?;
         self.adnl.clone().query_with_prefix(
             Some(&overlay.query_prefix), 
             query,
@@ -1939,7 +1972,7 @@ impl OverlayNode {
         let src = overlay.overlay_key.as_ref().unwrap_or(&self.node_key).id();
         let peers = AdnlPeers::with_keys(src.clone(), dst.clone());
         #[cfg(feature = "telemetry")]
-        overlay.update_stats(dst, data.tag, true)?;
+        overlay.update_stats(dst, data.tag, true).await?;
         rldp.query(data, max_answer_size, &peers, roundtrip).await
     }
 
@@ -2346,7 +2379,7 @@ impl Subscriber for OverlayNode {
         }
         #[cfg(feature = "telemetry")] {
             let (tag, _) = bundle[0].serialize_boxed();
-            overlay.update_stats(peers.other(), tag.0, false)?;
+            overlay.update_stats(peers.other(), tag.0, false).await?;
         }
         if bundle.len() == 2 {
             // Private overlay
@@ -2451,7 +2484,7 @@ impl Subscriber for OverlayNode {
         #[cfg(feature = "telemetry")] 
         if !other_workchain {
             let (tag, _) = objects[0].serialize_boxed();
-            overlay.update_stats(peers.other(), tag.0, false)?;
+            overlay.update_stats(peers.other(), tag.0, false).await?;
         }
         let object = match objects.remove(0).downcast::<GetRandomPeers>() {
             Ok(query) => {
