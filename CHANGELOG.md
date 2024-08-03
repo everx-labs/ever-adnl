@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## Version 0.11.4
+
+- More stability bugfixes
+
 ## Version 0.11.1
 
 - Stability bugfixes
