@@ -2153,7 +2153,7 @@ impl AdnlNode {
     const TIMEOUT_QUERY_MIN_MS: u64 = 500;   
     const TIMEOUT_QUERY_MAX_MS: u64 = 5000; 
     const TIMEOUT_QUERY_STOP_MS: u64 = 1; 
-    const TIMEOUT_SHUTDOWN_MS: u64 = 2000; 
+    const TIMEOUT_SHUTDOWN_MS: u64 = 50;
     const TIMEOUT_TRANSFER_SEC: u64 = 5;
     
     /// Constructor
@@ -3485,6 +3485,18 @@ impl AdnlNode {
                 )
             }
         }
+        if let Some(seqno) = &packet.confirm_seqno {
+            let local_seqno = peer.send_state.seqno(priority);
+            if *seqno as u64 > local_seqno {
+                fail!(
+                    "Peer {}: too new ADNL packet seqno confirmed: {}, expected <= {}, {}", 
+                    ret,
+                    seqno, 
+                    local_seqno,
+                    priority
+                )
+            }
+        }
         if let Some(seqno) = &packet.seqno {
             match peer.recv_state.save_seqno(*seqno as u64, priority).await {
                 Err(e) => fail!(
@@ -3503,18 +3515,6 @@ impl AdnlNode {
             peer.recv_state.seqno(priority),
             priority
         );
-        if let Some(seqno) = &packet.confirm_seqno {
-            let local_seqno = peer.send_state.seqno(priority);
-            if *seqno as u64 > local_seqno {
-                fail!(
-                    "Peer {}: too new ADNL packet seqno confirmed: {}, expected <= {}, {}", 
-                    ret,
-                    seqno, 
-                    local_seqno,
-                    priority
-                )
-            }
-        }
         Ok(Some(ret))	
     }
 
