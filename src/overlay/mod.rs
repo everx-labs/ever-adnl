@@ -30,10 +30,9 @@ use crate::rldp::{Constraints, RaptorqDecoder, RaptorqEncoder, RldpNode};
 use num_traits::pow::Pow;
 use std::{
     cmp::min, convert::TryInto, 
-    sync::{Arc, atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}}, time::Duration
+    sync::{Arc, atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}},
+    time::{Duration, Instant}
 };
-#[cfg(feature = "telemetry")]
-use std::time::Instant;
 use ever_api::{
     deserialize_boxed_bundle_with_suffix, IntoBoxed, serialize_boxed, serialize_boxed_append, 
     ton::{ //ever::{
@@ -289,6 +288,7 @@ declare_counted!(
         purge_broadcasts: lockfree::queue::Queue<BroadcastId>,
         purge_broadcasts_count: AtomicU32,
         query_prefix: Vec<u8>,
+        queue_broadcasts: tokio::sync::mpsc::UnboundedSender<(BroadcastId, Instant)>,
 //        random_peers: AddressCache,
         received_catchain: Option<Arc<CatchainReceiver>>,
         received_block_status: Option<Arc<BlockCandidateStatusReceiver>>,
@@ -329,8 +329,8 @@ impl Overlay {
     const SIZE_BROADCAST_WAVE: u32 = 20;
     const SIZE_NEIGHBOURS_LONG_BROADCAST: u8 = 5;
     const SIZE_NEIGHBOURS_SHORT_BROADCAST: u8 = 3;
-    const SPINNER: u64 = 10;              // Milliseconds
-    const TIMEOUT_BROADCAST: u64 = 60;    // Seconds
+    const SPINNER_MS: u64 = 10;               // Milliseconds
+    const TIMEOUT_BROADCAST_SEC: u64 = 60;    // Seconds
 
     fn calc_broadcast_id(&self, data: &[u8], allow_dup: bool) -> Result<Option<BroadcastId>> {
         let bcast_id = sha256_digest(data);
@@ -556,13 +556,13 @@ impl Overlay {
             async move {
                 loop {
                     tokio::time::sleep(
-                        Duration::from_millis(Self::TIMEOUT_BROADCAST * 100)
+                        Duration::from_millis(Self::TIMEOUT_BROADCAST_SEC * 100)
                     ).await;
                     if let Some(transfer) = overlay_wait.owned_broadcasts.get(
                         &bcast_id_wait
                     ) {
                         if let OwnedBroadcast::RecvFec(transfer) = transfer.val() {
-                            if !transfer.updated_at.is_expired(Self::TIMEOUT_BROADCAST) {
+                            if !transfer.updated_at.is_expired(Self::TIMEOUT_BROADCAST_SEC) {
                                 continue
                             }
                             if !transfer.completed.load(Ordering::Relaxed) {
@@ -586,7 +586,7 @@ impl Overlay {
                     }
                     break
                 }
-                Self::setup_broadcast_purge(&overlay_wait, bcast_id_wait);
+                overlay_wait.setup_broadcast_purge(bcast_id_wait).ok();
             }
         );
 
@@ -687,7 +687,7 @@ impl Overlay {
                             break
                         }
                     }
-                    tokio::time::sleep(Duration::from_millis(Self::SPINNER)).await;            
+                    tokio::time::sleep(Duration::from_millis(Self::SPINNER_MS)).await;
                 }
             }
         );
@@ -731,7 +731,7 @@ impl Overlay {
                 reader.close();
                 while reader.recv().await.is_some() { 
                 }
-                Self::setup_broadcast_purge(&overlay, bcast_id);
+                overlay.setup_broadcast_purge(bcast_id).ok();
             }
         );
         Ok(ret)
@@ -792,7 +792,7 @@ impl Overlay {
 
     fn is_broadcast_outdated(&self, date: i32, peer: &Arc<KeyId>) -> bool {
         let now = Version::get();
-        if date + (Self::TIMEOUT_BROADCAST as i32) < now {
+        if date + (Self::TIMEOUT_BROADCAST_SEC as i32) < now {
             log::warn!(
                 target: TARGET,
                 "Old FEC broadcast {} seconds old from {} in overlay {}",
@@ -1005,8 +1005,7 @@ impl Overlay {
             #[cfg(feature = "telemetry")]
             tag
         ).await?;
-        Self::setup_broadcast_purge(overlay, bcast_id);
-        Ok(())
+        overlay.setup_broadcast_purge(bcast_id)
     }
 
     async fn receive_fec_broadcast(
@@ -1243,7 +1242,7 @@ impl Overlay {
             overlay_key,
             &neighbours,
         ).await?;
-        Self::setup_broadcast_purge(overlay, bcast_id);
+        overlay.setup_broadcast_purge(bcast_id)?;
         let ret = BroadcastSendInfo {
             packets: 1,
             send_to: neighbours.len() as u32
@@ -1251,15 +1250,10 @@ impl Overlay {
         Ok(ret)
     } 
 
-    fn setup_broadcast_purge(overlay: &Arc<Self>, bcast_id: BroadcastId) {
-        let overlay = overlay.clone();
-        tokio::spawn(
-            async move {
-                tokio::time::sleep(Duration::from_secs(Self::TIMEOUT_BROADCAST)).await;
-                overlay.purge_broadcasts_count.fetch_add(1, Ordering::Relaxed);
-                overlay.purge_broadcasts.push(bcast_id);
-            }
-        );
+    fn setup_broadcast_purge(&self, bcast_id: BroadcastId) -> Result<()> {
+        self.queue_broadcasts.send((bcast_id, Instant::now())).map_err(
+            |e| error!("Error putting broadcast into monitoring queue: {}", e)
+        )
     }
 
     fn update_neighbours(&self, n: u32) -> Result<()> {
@@ -1579,8 +1573,8 @@ impl OverlayNode {
     const MAX_OVERLAY_NEIGHBOURS: u32 = 200;
 //    const MAX_OVERLAY_PEERS: u32 = 20;
     const MAX_SIZE_ORDINARY_BROADCAST: usize = 768;
-    const TIMEOUT_GC: u64 = 1000; // Milliseconds
-    const TIMEOUT_PEERS: u64 = 60000; // Milliseconds
+    const TIMEOUT_GC_MS: u64 = 1000; // Milliseconds
+    const TIMEOUT_PEERS_MS: u64 = 60000; // Milliseconds
 
     /// Constructor 
     pub fn with_adnl_node_and_zero_state(
@@ -2055,6 +2049,7 @@ impl OverlayNode {
         if overlay_key.is_some() && ((flags & Overlay::FLAG_OVERLAY_OTHER_WORKCHAIN) != 0) {
             fail!("Cannot create private overlay {} for other workchain", overlay_id)
         }
+        let mut queue_receiver = None;
         let added = add_counted_object_to_map(
             &self.overlays,
             overlay_id.clone(), 
@@ -2091,6 +2086,8 @@ impl OverlayNode {
                 } else {
                     None
                 };
+                let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+                queue_receiver = Some(receiver);
                 let overlay = Overlay {
                     adnl: self.adnl.clone(),
                     bad_peers: lockfree::set::Set::new(),
@@ -2107,6 +2104,7 @@ impl OverlayNode {
                     purge_broadcasts: lockfree::queue::Queue::new(),
                     purge_broadcasts_count: AtomicU32::new(0),
                     query_prefix: serialize_boxed(&query_prefix)?,
+                    queue_broadcasts: sender,
   //                  random_peers: AddressCache::with_limit(Self::MAX_OVERLAY_PEERS),
                     received_catchain,
                     received_block_status,
@@ -2159,12 +2157,32 @@ impl OverlayNode {
             }
         )?;
         if added {
+            let Some(mut receiver) = queue_receiver else {
+                fail!("INTERNAL ERROR: no broadcast queue receiver in overlay {}", overlay_id)
+            };
             let overlay = self.get_overlay(overlay_id, "Cannot add overlay")?;
             let handle = runtime.unwrap_or_else(tokio::runtime::Handle::current);
             handle.spawn(
                 async move {
                     let mut timeout_peers = 0;
+                    let mut last_broadcast = None;
                     while Arc::strong_count(&overlay) > 1 {
+                        loop {
+                            if last_broadcast.is_none() && !receiver.is_empty() {
+                                last_broadcast = receiver.recv().await;
+                            }
+                            if let Some((bcast_id, start)) = &last_broadcast {
+                                if start.elapsed().as_secs() >= Overlay::TIMEOUT_BROADCAST_SEC {
+                                    overlay.purge_broadcasts_count.fetch_add(1, Ordering::Relaxed);
+                                    overlay.purge_broadcasts.push(*bcast_id);
+                                    last_broadcast = None            
+                                } else {
+                                    break
+                                }
+                            } else {
+                                break
+                            }
+                        }
                         let upto = Self::MAX_BROADCAST_LOG;
                         while overlay.purge_broadcasts_count.load(Ordering::Relaxed) > upto {
                             if let Some(bcast_id) = overlay.purge_broadcasts.pop() {
@@ -2174,8 +2192,8 @@ impl OverlayNode {
                             }
                             overlay.purge_broadcasts_count.fetch_sub(1, Ordering::Relaxed);
                         }
-                        timeout_peers += Self::TIMEOUT_GC;
-                        if timeout_peers > Self::TIMEOUT_PEERS {
+                        timeout_peers += Self::TIMEOUT_GC_MS;
+                        if timeout_peers > Self::TIMEOUT_PEERS_MS {
 //                            let result = if overlay.overlay_key.is_some() {
 //                                overlay.update_neighbours(1)
 //                            } else {
@@ -2187,7 +2205,7 @@ impl OverlayNode {
                             }
                             timeout_peers = 0;
                         }
-                        tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_GC)).await;
+                        tokio::time::sleep(Duration::from_millis(Self::TIMEOUT_GC_MS)).await;
                     }
                 }
             );

@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## Version 0.11.31
+
+- Optimizations in broadcast monitoring
+
 ## Version 0.11.21
 
 - Minor bugfixes
