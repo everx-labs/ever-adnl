@@ -1907,6 +1907,12 @@ impl OverlayNode {
         self.sign_local_node(overlay_id)
     }
 
+    /// Check whether peer is known
+    pub fn have_peer(&self, local_key: Option<&Arc<KeyId>>, peer: &Arc<KeyId>) -> Result<bool> {
+        let local_key = local_key.unwrap_or(self.node_key.id());
+        self.adnl.have_peer(local_key, peer)
+    }
+
     /// Send message via ADNL
     pub async fn message(
         &self, 
@@ -1933,7 +1939,7 @@ impl OverlayNode {
 
     /// Send query via ADNL
     pub async fn query(
-        &self, 
+        &self,
         dst: &Arc<KeyId>, 
         query: &TaggedTlObject,
         overlay_id: &Arc<OverlayShortId>,
