@@ -2884,6 +2884,19 @@ impl AdnlNode {
         self.delete_peer_from_peers(peers.val(), peer_key)
     }
 
+    /// Check whether peer is known
+    pub fn have_peer(
+        &self, 
+        local_key: &Arc<KeyId>, 
+        peer: &Arc<KeyId> 
+    ) -> Result<bool> {
+        let peers = self.peers.get(local_key).ok_or_else(
+            || error!("Try to check peer {} of unknown local key {}", peer, local_key)
+        )?;
+        let have = peers.val().map_of.get(peer).is_some();
+        Ok(have)
+    }
+
     /// Node IP address
     pub fn ip_address(&self) -> &IpAddress {
         self.config.ip_address()
