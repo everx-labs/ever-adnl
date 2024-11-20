@@ -213,13 +213,13 @@ impl Metric {
         if let Some((counter, average)) = &self.total_average {
             loop {
                 let counter_val = counter.load(Ordering::Relaxed);
-                let average_val = average.load(Ordering::Relaxed);
-                let update = ((update as i128 - average_val as i128) / 
-                    (counter_val as i128 + 1)) as u64;
+                let average_val = average.load(Ordering::Relaxed) as i128;
+                let update = (update as i128 - average_val) / 
+                    (counter_val as i128 + 1);
                 if !try_update(counter, counter_val, counter_val + 1) {
                     continue
                 }
-                if !try_update(average, average_val, average_val + update) {
+                if !try_update(average, average_val as u64, (average_val + update) as u64) {
                     counter.fetch_sub(1, Ordering::Relaxed);
                     continue
                 }
