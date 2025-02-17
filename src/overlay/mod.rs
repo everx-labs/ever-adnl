@@ -41,6 +41,10 @@ use ever_api::{
             FirstBlock as CatchainFirstBlock, Update as CatchainBlockUpdateBoxed, 
             blockupdate::BlockUpdate as CatchainBlockUpdate
         },
+        catchain::block::inner::{
+            Data as CatchainBlockInnerDataBoxed, 
+            catchain::block::data::data::Fork as CatchainFork
+        },
         fec::{Type as FecType, type_::RaptorQ as FecTypeRaptorQ}, 
         overlay::{
             Broadcast, Certificate as OverlayCertificate, Message as OverlayMessageBoxed, 
@@ -235,9 +239,14 @@ impl OverlayUtils {
 
 }
 
+pub enum CatchainData {
+    Catchain(CatchainFork),
+    ValidatorSession(ValidatorSessionBlockUpdate)
+}
+
 type BroadcastId = [u8; 32];
 type CatchainReceiver = BroadcastReceiver<
-    (CatchainBlockUpdate, ValidatorSessionBlockUpdate, Arc<KeyId>)
+    (CatchainBlockUpdate, CatchainData, Arc<KeyId>)
 >;
 type BlockCandidateStatusReceiver = BroadcastReceiver<
     (BlockCandidateStatus, Arc<KeyId>)
@@ -2016,7 +2025,7 @@ impl OverlayNode {
     pub async fn wait_for_catchain(
         &self, 
         overlay_id: &Arc<OverlayShortId>
-    ) -> Result<Option<(CatchainBlockUpdate, ValidatorSessionBlockUpdate, Arc<KeyId>)>> {
+    ) -> Result<Option<(CatchainBlockUpdate, CatchainData, Arc<KeyId>)>> {
         self.get_overlay(overlay_id, "Waiting for catchain in unknown overlay")?
             .received_catchain.as_ref().ok_or_else(
                 || error!("Waiting for catchain in public overlay {}", overlay_id)
@@ -2411,17 +2420,23 @@ impl Subscriber for OverlayNode {
                 Ok(CatchainBlockUpdateBoxed::Catchain_BlockUpdate(upd)) => upd,
                 Err(msg) => fail!("Unsupported private overlay message {:?}", msg)
             };
-            let validator_session_update = 
+            let inner_update = 
                 match bundle.remove(0).downcast::<ValidatorSessionBlockUpdateBoxed>() {
-                    Ok(ValidatorSessionBlockUpdateBoxed::ValidatorSession_BlockUpdate(upd)) => upd,
-                    Err(msg) => fail!("Unsupported private overlay message {:?}", msg)
+                    Ok(ValidatorSessionBlockUpdateBoxed::ValidatorSession_BlockUpdate(upd)) => 
+                        CatchainData::ValidatorSession(upd),
+                    Err(msg) => match msg.downcast::<CatchainBlockInnerDataBoxed>() {
+                       Ok(CatchainBlockInnerDataBoxed::Catchain_Block_Data_Fork(upd)) => 
+                           CatchainData::Catchain(upd),
+                       Ok(msg) => fail!("Unsupported private overlay message {:?}", msg),
+                       Err(msg) => fail!("Unsupported private overlay message {:?}", msg)
+                    }
                 };
             let receiver = overlay.received_catchain.as_ref().ok_or_else(
                 || error!("No catchain receiver in private overlay {}", overlay_id)
             )?;
             BroadcastReceiver::push(
                 receiver, 
-                (catchain_update, validator_session_update, peers.other().clone())
+                (catchain_update, inner_update, peers.other().clone())
             );
             Ok(true)
         } else {
