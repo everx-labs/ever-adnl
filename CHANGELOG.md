@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## Version 0.11.38
+
+- Fix build issues
+
 ## Version 0.11.37
 
 - Pass catchain from info to node
